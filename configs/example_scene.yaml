@@ -1,0 +1,53 @@
+name: vape
+video_path: /home/arpit/Desktop/scan2.MOV
+workspace_dir: workspace
+frames_dir: workspace/frames
+colmap_txt_dir: workspace/colmap_txt
+nerfstudio_data_dir: workspace/ns_data
+splat_config_path: workspace/ns_outputs/splatfacto/splatfacto/2026-05-17_203820/config.yml
+# Splatfacto training (ns-train). Re-run: scan2usd reconstruct … --skip-process-data
+process_data:
+  num_downscales: 2
+splatfacto:
+  max_num_iterations: 40000
+  experiment_name: splatfacto
+  use_bilateral_grid: true
+  background_color: black
+  rasterize_mode: antialiased
+  cull_alpha_thresh: 0.005
+  ssim_lambda: 0.15
+  # camera_res_scale_factor: 0.5   # uncomment if GPU OOM during training
+  camera_optimizer_mode: "off"
+renders_dir: workspace/renders
+dataset_dir: workspace/dataset
+classes:
+  - chair
+  - table
+  - door
+  - couch
+  - cabinet
+  - obstacle
+  - box
+yolo_model: yolov8n.pt
+train_epochs: 3
+train_imgsz: 640
+train_batch: 4
+seed: 42
+split:
+  strategy: session
+  val_sessions: []
+  val_ratio: 0.2
+pose_sampling:
+  num_poses: 64
+  position_jitter_m: 0.05
+  height_jitter_m: 0.02
+  max_rotation_deg: 8.0
+  interpolation_keyframes: 8
+lift:
+  min_points_in_box: 8
+  merge_center_dist_m: 0.35
+external:
+  colmap: colmap
+  ns_process_data: ns-process-data
+  ns_train: ns-train
+  ns_render: ns-render

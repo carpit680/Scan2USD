@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61,<82", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scan2usd"
+version = "0.1.0"
+description = "Offline RGB capture → 3DGS → synthetic YOLO dataset + A/B/C benchmark"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "setuptools>=61,<82",
+  "typer>=0.12",
+  "pyyaml>=6.0",
+  "numpy>=1.24",
+  "opencv-python-headless>=4.8",
+  "pillow>=10.0",
+  "tqdm>=4.66",
+  "ultralytics>=8.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.4"]
+# Optional: install Nerfstudio in the same venv. It may pull NumPy 1.x; see README "Python deps".
+nerfstudio = ["nerfstudio>=1.1.0,<1.2"]
+
+[project.scripts]
+scan2usd = "scan2usd.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+markers = [
+    "e2e: exercises lift/synthesize/export/benchmark on a synthetic workspace (slow)",
+]
