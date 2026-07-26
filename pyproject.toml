@@ -23,6 +23,8 @@ dependencies = [
 dev = ["pytest>=8.0", "ruff>=0.4"]
 # Optional: install Nerfstudio in the same venv. It may pull NumPy 1.x; see README "Python deps".
 nerfstudio = ["nerfstudio>=1.1.0,<1.2"]
+geometry = ["trimesh>=4.0", "open3d>=0.18", "scipy>=1.10"]
+review = ["gradio>=5.0"]
 
 [project.scripts]
 scan2usd = "scan2usd.cli:app"

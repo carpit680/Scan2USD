@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61,<82", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scan2usd-gui"
+version = "0.1.0"
+description = "FastAPI + React GUI for Scan2USD"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "python-multipart>=0.0.9",
+  "pydantic>=2.0",
+  "pyyaml>=6.0",
+  "qrcode>=7.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "httpx>=0.27"]
+
+[project.scripts]
+scan2usd-gui = "scan2usd_gui.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["scan2usd_gui*"]
+
+[tool.setuptools.package-data]
+scan2usd_gui = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -1,8 +1,20 @@
-# Scan2USD (MVP)
+# Scan2USD
 
-Offline pipeline: **RGB capture → COLMAP/Nerfstudio (Splatfacto) → synthetic viewpoints → YOLO labels → A/B/C benchmark**.
+Hybrid scan compiler for **Isaac Sim 6.x**:
 
-**Full manual:** [docs/USAGE.md](docs/USAGE.md) — every command, YAML option, workspace layout, experiments, and troubleshooting.
+```text
+room/workcell capture
+  → metric camera/scene registration
+  → photoreal 3DGRUT Gaussian ParticleField (visual only)
+  → dense static triangle collision geometry
+  → reviewed, separately reconstructed rigid-object meshes
+  → baked + relightable PBR material variants
+  → layered OpenUSD scene with PhysX rigid bodies and validation reports
+```
+
+The older Splatfacto → synthetic-YOLO benchmark commands remain available as a legacy workflow. They are not used to generate production USD assets.
+
+**Full manual:** [docs/USAGE.md](docs/USAGE.md).
 
 ## Quickstart
 
@@ -10,7 +22,7 @@ Offline pipeline: **RGB capture → COLMAP/Nerfstudio (Splatfacto) → synthetic
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -U pip wheel
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[dev,geometry,review]"
 ```
 
 PyTorch (pulled in by Ultralytics) currently pins **setuptools to versions below 82**. Avoid `pip install -U setuptools` with no upper bound, or pip will report a conflict with `torch`. This package declares `setuptools>=61,<82` so editable installs stay compatible.
@@ -23,9 +35,9 @@ Relative paths (`workspace/`, etc.) resolve against the **current working direct
 
 To resolve relative to the config file instead (old behavior), set `paths_relative_to: config` at the top of the YAML.
 
-`reconstruct` will **extract frames from `video_path`** automatically if `frames_dir` is missing or has no images (so you can skip a separate `preprocess` step when a video is configured).
+`reconstruct` will **extract frames from `video_path`** automatically if `frames_dir` is missing or has no images, using a **subsampled** default (`--video-stride 15`, `--video-max-frames 600`) so COLMAP is not flooded with near-duplicate frames. Use `scan2usd preprocess` for full control, or pass e.g. `--video-stride 1 --video-max-frames 0` only if you know you need dense sampling.
 
-### External tools (COLMAP, Nerfstudio, ffmpeg)
+### External tools
 
 `reconstruct` / `synthesize` need **COLMAP** and **Nerfstudio** CLIs. **ffmpeg** must also be on `PATH`; Nerfstudio's `ns-process-data` calls it even for the `images` flow (resize / transcode paths).
 
@@ -45,6 +57,15 @@ On **Linux**, doctor prints a single **`sudo apt install …`** line aggregating
 
 You can override binaries in YAML under `external:` (`colmap`, `ns_process_data`, `ns_train`, `ns_render`) with full paths.
 
+Production USD builds deliberately isolate heavyweight/incompatible runtimes. Configure:
+
+- NVIDIA **3DGRUT v1.1+** for standard `UsdVol.ParticleField3DGaussianSplat`.
+- **nvblox** for RGB-D/LiDAR static geometry, or **OpenMVS** for RGB-only dense geometry.
+- A **SAM2** mask-propagation runner and masked object-reconstruction runner.
+- Isaac Sim 6.x `python.sh` for USDC conversion and headless physics validation.
+
+`scan2usd doctor` reports each configured production tool separately.
+
 ### Python deps: Ultralytics + Nerfstudio in one venv
 
 Ultralytics installs **`opencv-python`**, which expects **NumPy 2.x**. A plain **`pip install nerfstudio`** can downgrade NumPy to **1.26** (transitive deps such as **nuscenes-devkit**), which triggers pip’s warning: *opencv-python requires numpy>=2, but you have numpy 1.26.4*.
@@ -56,36 +77,59 @@ pip install "numpy>=2,<3"
 pip install -e ".[dev]"   # re-apply scan2usd pins if needed
 ```
 
-Pip may then warn that **nuscenes-devkit** wants NumPy below 2; many Nerfstudio workflows still run. If `ns-train` or imports fail, use a **second environment** for `ns-*` only and set `external.ns_process_data`, `external.ns_train`, and `external.ns_render` to that env’s scripts.
+Pip may then warn that **nuscenes-devkit** wants NumPy below 2; many Nerfstudio workflows still run. Keep 3DGRUT, SAM2, nvblox, and Isaac in their own environments and configure their command paths instead of merging all dependencies into this venv.
 
-1. Put frames under `workspace/frames/` (or set `video_path` to an **MP4, MOV**, or other FFmpeg-backed file and run `scan2usd preprocess`).
-2. Run **`scan2usd doctor`** and install anything reported missing.
-3. Run stages:
+### Hybrid USD workflow
+
+1. Configure the `capture`, `reconstruction`, `segmentation`, `geometry`, `materials`, `physics`, `usd`, `qa`, and `external` sections in `configs/example_scene.yaml`.
+2. Reconstruct camera poses, then initialize and segment the USD build:
 
 ```bash
 scan2usd reconstruct configs/example_scene.yaml
-scan2usd label configs/example_scene.yaml
-scan2usd lift configs/example_scene.yaml
+scan2usd init-usd configs/example_scene.yaml --mode production
+scan2usd segment-usd configs/example_scene.yaml
+scan2usd review configs/example_scene.yaml
 ```
 
-4. Train splats (inside Nerfstudio env), then set `splat_config_path` in the YAML to the exported `config.yml` from `ns-train`.
+3. RGB-only captures require an approved COLMAP→USD similarity transform (Z-up, meters):
 
 ```bash
-scan2usd synthesize configs/example_scene.yaml
-scan2usd export-dataset configs/example_scene.yaml --mode mixed
-scan2usd benchmark configs/example_scene.yaml --experiment all
+scan2usd apply-metric-scale configs/example_scene.yaml \
+  --known-length-m 0.91 --source-length 2.45 --reviewer NAME
+# Or: scan2usd set-metric-transform configs/example_scene.yaml calibration.json --reviewer NAME
 ```
 
-Cleanup between runs: `scan2usd clean configs/example_scene.yaml --tier light|medium|full` (see [docs/USAGE.md](docs/USAGE.md#scan2usd-clean)).
+4. Build/resume. The command intentionally pauses when mask, physical-property, material, or lighting approval is required:
+
+```bash
+scan2usd build-usd configs/example_scene.yaml
+scan2usd review configs/example_scene.yaml
+scan2usd build-usd configs/example_scene.yaml
+scan2usd validate-usd configs/example_scene.yaml --held-out-renders /path/to/isaac/renders
+```
+
+The root stage is `workspace/usd/scene.usd`; `workspace/usd/build_report.json` states whether it passed the production gates.
 
 See [docs/capture_sop.md](docs/capture_sop.md) for capture guidance.
+
+### GUI
+
+A separate FastAPI + React UI lives under [`gui/`](gui/). It exposes every CLI command, YAML parameter (with tooltips), pipeline stages, review gates, doctor, and an in-app guide. Gradio `scan2usd review` is unchanged.
+
+```bash
+pip install -e gui/backend
+cd gui/frontend && npm install && cd ../..
+make gui   # API :8765 + Vite :5173
+```
+
+See [gui/README.md](gui/README.md).
 
 ### Tests
 
 - **`make test`** — unit tests only (`python -m pytest -m "not e2e"`).
-- **`make test-e2e`** — full **lift → synthesize → export → benchmark (B)** on a synthetic in-repo workspace (first run may download YOLO weights).
+- **`make test-e2e`** — legacy synthetic-YOLO smoke test.
 
 ### More documentation
 
-- **[docs/USAGE.md](docs/USAGE.md)** — complete command reference, all YAML keys, `process_data` / `splatfacto` tuning, Makefile, experiments A/B/C, troubleshooting.
+- **[docs/USAGE.md](docs/USAGE.md)** — hybrid USD workflow, command reference, validation, and legacy commands.
 - **[docs/capture_sop.md](docs/capture_sop.md)** — how to record video for COLMAP / splats.

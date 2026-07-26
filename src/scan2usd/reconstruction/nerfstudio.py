@@ -195,6 +195,22 @@ def ns_viewer(cfg: SceneConfig, load_config: Path) -> None:
     run_cmd([*argv0, "--load-config", str(load_config.resolve())])
 
 
+def ns_viewer_with_boxes(
+    cfg: SceneConfig,
+    load_config: Path,
+    objects_npz: Path,
+) -> None:
+    """Open the splat in Nerfstudio's viewer with lifted 3D AABB wireframes overlaid."""
+    from scan2usd.viz.viewer import run_splat_viewer_with_boxes
+
+    run_splat_viewer_with_boxes(
+        load_config.resolve(),
+        objects_npz.resolve(),
+        list(cfg.classes),
+        ns_data_dir=cfg.nerfstudio_data_dir,
+    )
+
+
 def find_ns_colmap_sparse(ns_data_dir: Path) -> Path | None:
     """Typical path after ns-process-data: colmap/sparse/0."""
     p = ns_data_dir / "colmap" / "sparse" / "0"

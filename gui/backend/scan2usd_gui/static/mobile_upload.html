@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Scan2USD — Upload video</title>
+  <style>
+    :root {
+      --bg: #0c1118;
+      --card: #151c27;
+      --ink: #e8eef7;
+      --muted: #8b9bb0;
+      --accent: #5ec8a8;
+      --danger: #f07178;
+      --ok: #7fd99a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100dvh;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: radial-gradient(1200px 600px at 20% -10%, #1a2a3a 0%, var(--bg) 55%);
+      color: var(--ink);
+      padding: 1.25rem;
+    }
+    main {
+      max-width: 28rem;
+      margin: 0 auto;
+      padding: 1.5rem 1.25rem;
+      background: var(--card);
+      border: 1px solid #2a3545;
+      border-radius: 1rem;
+    }
+    h1 { font-size: 1.35rem; margin: 0 0 0.35rem; font-weight: 650; }
+    p { color: var(--muted); line-height: 1.45; margin: 0.5rem 0 1rem; font-size: 0.95rem; }
+    .banner {
+      padding: 0.75rem 0.9rem;
+      border-radius: 0.65rem;
+      margin-bottom: 1rem;
+      font-size: 0.9rem;
+    }
+    .banner.err { background: rgba(240,113,120,0.15); color: var(--danger); }
+    .banner.ok { background: rgba(127,217,154,0.12); color: var(--ok); }
+    .banner.info { background: rgba(94,200,168,0.12); color: var(--accent); }
+    label.pick {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 3.25rem;
+      padding: 0.85rem 1rem;
+      border-radius: 0.75rem;
+      background: var(--accent);
+      color: #0c1118;
+      font-weight: 650;
+      font-size: 1.05rem;
+      cursor: pointer;
+    }
+    label.pick:active { opacity: 0.9; }
+    label.pick.disabled { opacity: 0.4; pointer-events: none; }
+    input[type="file"] { display: none; }
+    .name { margin-top: 0.75rem; font-size: 0.85rem; color: var(--muted); word-break: break-all; }
+    button.send {
+      width: 100%;
+      margin-top: 1rem;
+      min-height: 3rem;
+      border: none;
+      border-radius: 0.75rem;
+      background: #2a3545;
+      color: var(--ink);
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button.send:disabled { opacity: 0.4; cursor: not-allowed; }
+    button.send.ready { background: var(--accent); color: #0c1118; }
+    .bar {
+      margin-top: 1rem;
+      height: 0.5rem;
+      background: #2a3545;
+      border-radius: 999px;
+      overflow: hidden;
+      display: none;
+    }
+    .bar > span {
+      display: block;
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+      transition: width 0.15s linear;
+    }
+    .foot { margin-top: 1.25rem; font-size: 0.75rem; color: #627388; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Upload room video</h1>
+    <p>Same Wi‑Fi as the Scan2USD machine. The desktop will pick up the file automatically.</p>
+
+    <div id="banner" class="banner info" hidden></div>
+
+    <div id="form">
+      <label class="pick" id="pickLabel">
+        Choose video
+        <input id="file" type="file" accept="video/*,.mp4,.mov,.webm,.mkv,.m4v" />
+      </label>
+      <div class="name" id="fname">No file selected</div>
+      <button class="send" id="send" type="button" disabled>Upload</button>
+      <div class="bar" id="bar"><span id="prog"></span></div>
+    </div>
+
+    <p class="foot">Host LAN · {{PRIMARY_IP}}</p>
+  </main>
+  <script>
+    const STATUS = "{{STATUS}}";
+    const MESSAGE = "{{MESSAGE}}";
+    const TOKEN = "{{TOKEN}}";
+    const SESSION_ID = "{{SESSION_ID}}";
+
+    const banner = document.getElementById("banner");
+    const form = document.getElementById("form");
+    const fileInput = document.getElementById("file");
+    const fname = document.getElementById("fname");
+    const send = document.getElementById("send");
+    const pickLabel = document.getElementById("pickLabel");
+    const bar = document.getElementById("bar");
+    const prog = document.getElementById("prog");
+
+    function showBanner(text, kind) {
+      banner.hidden = false;
+      banner.textContent = text;
+      banner.className = "banner " + kind;
+    }
+
+    if (STATUS !== "ok") {
+      showBanner(MESSAGE || "Cannot upload.", STATUS === "done" ? "ok" : "err");
+      if (STATUS !== "done") {
+        form.style.display = "none";
+      } else {
+        pickLabel.classList.add("disabled");
+        send.disabled = true;
+      }
+    }
+
+    let chosen = null;
+    fileInput.addEventListener("change", () => {
+      chosen = fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
+      fname.textContent = chosen ? chosen.name + " (" + Math.round(chosen.size / 1048576 * 10) / 10 + " MB)" : "No file selected";
+      send.disabled = !chosen;
+      send.classList.toggle("ready", !!chosen);
+    });
+
+    send.addEventListener("click", () => {
+      if (!chosen || !TOKEN || !SESSION_ID) return;
+      send.disabled = true;
+      pickLabel.classList.add("disabled");
+      bar.style.display = "block";
+      prog.style.width = "0%";
+
+      const fd = new FormData();
+      fd.append("file", chosen, chosen.name);
+
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/mobile/sessions/" + encodeURIComponent(SESSION_ID) + "/upload?token=" + encodeURIComponent(TOKEN));
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          prog.style.width = Math.round((e.loaded / e.total) * 100) + "%";
+        }
+      };
+      xhr.onload = () => {
+        try {
+          const body = JSON.parse(xhr.responseText || "{}");
+          if (xhr.status >= 200 && xhr.status < 300) {
+            prog.style.width = "100%";
+            showBanner("Uploaded. You can return to the desktop — path: " + (body.path || body.filename), "ok");
+            form.querySelector(".pick").style.display = "none";
+            send.style.display = "none";
+          } else {
+            showBanner(body.detail || ("Upload failed (" + xhr.status + ")"), "err");
+            send.disabled = false;
+            pickLabel.classList.remove("disabled");
+          }
+        } catch (err) {
+          showBanner("Upload failed: " + err, "err");
+          send.disabled = false;
+          pickLabel.classList.remove("disabled");
+        }
+      };
+      xhr.onerror = () => {
+        showBanner("Network error — check Wi‑Fi and that the desktop is still running gui-lan.", "err");
+        send.disabled = false;
+        pickLabel.classList.remove("disabled");
+      };
+      xhr.send(fd);
+    });
+  </script>
+</body>
+</html>

@@ -103,3 +103,16 @@ def frames_dir_has_images(frames_dir: Path) -> bool:
         return False
     exts = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
     return any(p.suffix in exts for p in frames_dir.iterdir() if p.is_file())
+
+
+def clear_frame_images(frames_dir: Path) -> int:
+    """Delete JPEG/PNG frames in ``frames_dir`` (non-recursive). Returns count removed."""
+    if not frames_dir.is_dir():
+        return 0
+    exts = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
+    removed = 0
+    for path in frames_dir.iterdir():
+        if path.is_file() and path.suffix in exts:
+            path.unlink()
+            removed += 1
+    return removed

@@ -1,0 +1,157 @@
+# Highest-quality 3DGRUT / hybrid USD build profile.
+# Drop-in replacement for configs/example_scene.yaml (same workspace paths).
+# Use for final Isaac Sim packages when training time and VRAM allow.
+# For fast iteration, use preview settings (grut_max_iterations: 5000) instead.
+name: vape
+video_path: /home/arpit/Desktop/scan2.MOV
+workspace_dir: workspace
+frames_dir: workspace/frames
+colmap_txt_dir: workspace/colmap_txt
+nerfstudio_data_dir: workspace/ns_data
+splat_config_path: workspace/ns_outputs/splatfacto/splatfacto/2026-05-18_211255/config.yml
+# Splatfacto training (ns-train). Re-run: scan2usd reconstruct … --skip-process-data
+process_data:
+  num_downscales: 1   # full-res COLMAP inputs (sharper; more VRAM/disk than example_scene's 2)
+splatfacto:
+  max_num_iterations: 40000
+  experiment_name: splatfacto
+  use_bilateral_grid: true
+  background_color: black
+  rasterize_mode: antialiased
+  cull_alpha_thresh: 0.005
+  ssim_lambda: 0.15
+  # camera_res_scale_factor: 0.5   # uncomment if GPU OOM during training
+  camera_optimizer_mode: "off"
+renders_dir: workspace/renders
+dataset_dir: workspace/dataset
+classes:
+  # Open-vocab prompts for movable tabletop objects (not large furniture).
+  - bottle
+  - cup
+  - mug
+  - cell phone
+  - remote
+  - toaster
+  - can
+  - jar
+  - laptop
+  - backpack
+yolo_model: yolov8n.pt
+train_epochs: 3
+train_imgsz: 640
+train_batch: 4
+seed: 42
+split:
+  strategy: session
+  val_sessions: []
+  val_ratio: 0.2
+pose_sampling:
+  num_poses: 64
+  position_jitter_m: 0.05
+  height_jitter_m: 0.02
+  max_rotation_deg: 8.0
+  interpolation_keyframes: 8
+lift:
+  min_points_in_box: 8
+  merge_center_dist_m: 0.35   # lower while debugging; raises duplicate boxes
+  depth_trim_mad: 2.0
+  inner_margin_frac: 0.12     # shrink 2D box inward to drop wall/floor bleed
+  depth_percentile: [10, 90]  # drop far/near tails along the ray
+  percentile: [5, 95]
+  # max_extent_m: 6.0   # optional cap per box (meters); omit for no cap
+
+# Hybrid Scan-to-USD pipeline (Isaac Sim 6.x).
+capture:
+  modality: rgb             # rgb | rgbd | lidar
+  depth_dir: null           # required for rgbd
+  lidar_path: null          # required for lidar
+  calibration_path: null    # JSON with colmap_to_usd 4x4 + metric scale
+  clean_plate_dir: null     # same-view images after movable objects are removed
+  object_capture_dirs: {}   # optional: {box_001: /path/to/detail/images}
+  scale_anchor_m: null      # RGB hint only; approve full transform separately
+
+reconstruction:
+  visual_backend: 3dgrut
+  rgbd_geometry_backend: nvblox
+  rgb_geometry_backend: openmvs
+  grut_config: apps/colmap_3dgut.yaml
+  grut_max_iterations: 50000
+  held_out_ratio: 0.05
+  preview_allow_unobserved_background: true
+  # Extra Hydra overrides for densify / LR schedule / SH ramp (match n_iterations).
+  grut_overrides:
+    - scheduler.positions.max_steps=50000
+    - strategy.densify.end_iteration=25000
+    - loss.lambda_ssim=0.25
+    - model.progressive_training.increase_frequency=500
+  splat_cleanup:
+    enabled: true
+    outlier_std: 4.0      # higher keeps more distant floaters
+    min_opacity: 0.01
+    max_scale: null
+
+segmentation:
+  proposal_model: yolov8s-worldv2.pt
+  mask_model: sam2
+  masks_dir: workspace/masks
+  min_views_per_object: 3
+  review_required: true
+
+geometry:
+  voxel_size_m: 0.02
+  target_static_triangles: 500000
+  target_object_triangles: 100000
+  simplify_ratio: 0.35
+  rgb_only_requires_scale: true
+
+materials:
+  texture_resolution: 4096
+  author_baked_variant: true
+  author_pbr_variant: true
+  estimate_lighting: true
+  hdr_path: null
+
+physics:
+  default_density_kg_m3: 700
+  default_friction: 0.5
+  default_restitution: 0.05
+  dynamic_collider: convexDecomposition
+  vhacd_max_hulls: 32
+  vhacd_resolution: 100000
+
+usd:
+  output_dir: workspace/usd
+  root_filename: scene.usd
+  isaac_version: "6.0"
+  meters_per_unit: 1.0
+  up_axis: Z
+  default_look: pbr
+  render_mode: hybrid
+  binary_mesh_layers: false
+
+qa:
+  required: true
+  min_background_coverage: 0.9
+  max_registration_error_m: 0.03
+  max_depth_error_m: 0.05
+  min_texture_coverage: 0.9
+  max_dynamic_collider_faces: 20000
+  require_held_out_renders: true
+  require_isaac_validation: true
+
+external:
+  colmap: colmap
+  ns_process_data: ns-process-data
+  ns_train: ns-train
+  ns_render: ns-render
+  grut_python: /home/arpit/Scan2USD/workspace/external/3dgrut/.venv/bin/python
+  grut_root: /home/arpit/Scan2USD/workspace/external/3dgrut
+  nvblox: nvblox                    # project runner accepting the documented CLI contract
+  openmvs_interface: /home/arpit/Scan2USD/workspace/bin/InterfaceCOLMAP
+  openmvs_densify: /home/arpit/Scan2USD/workspace/bin/DensifyPointCloud
+  openmvs_reconstruct: /home/arpit/Scan2USD/workspace/bin/ReconstructMesh
+  openmvs_refine: /home/arpit/Scan2USD/workspace/bin/RefineMesh
+  openmvs_texture: TextureMesh
+  sam2_runner: "/home/arpit/Scan2USD/.venv/bin/python /home/arpit/Scan2USD/tools/segmentation/sam2_runner.py --max-objects 1 --batch-size 2"
+  object_reconstruction_runner: "/home/arpit/Scan2USD/.venv/bin/python /home/arpit/Scan2USD/tools/geometry/masked_object_recon.py"
+  isaac_python: /home/arpit/Scan2USD/workspace/isaac_env/bin/python

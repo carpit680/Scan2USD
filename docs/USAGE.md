@@ -1,8 +1,8 @@
 # Scan2USD — Usage manual
 
-Offline pipeline: **RGB capture → COLMAP / Nerfstudio (Splatfacto) → synthetic viewpoints → YOLO labels → A/B/C benchmark**.
+Primary pipeline: **room/workcell capture → Gaussian ParticleField visuals + solid geometry → reviewed rigid objects → layered Isaac Sim USD**.
 
-This document describes **every** `scan2usd` command, YAML option, workspace layout, Makefile targets, and common Nerfstudio workflows used under the hood.
+The former Splatfacto → synthetic-YOLO benchmark remains documented as a legacy workflow.
 
 ---
 
@@ -23,7 +23,187 @@ This document describes **every** `scan2usd` command, YAML option, workspace lay
 
 ---
 
-## Pipeline overview
+## Hybrid Scan-to-USD workflow
+
+### What the export contains
+
+`scan2usd` composes a root `scene.usd` from independent layers:
+
+```text
+workspace/usd/
+  scene.usd                         # root stage, variants, PhysicsScene
+  environment/
+    splat.usd                       # 3DGRUT standard ParticleField; visual only
+    collision.usdc                  # invisible static triangle collision
+    proxy.usdc                      # alignment/depth/matte-shadow proxy
+  objects/<instance_id>/
+    geometry.usdc                   # local render mesh
+    collision.usdc                  # convex-decomposition source
+    materials.usda                  # baked and PBR variants
+    physics.usda                    # mass, inertia, friction, restitution
+    asset.usd                       # reusable object interface
+  lighting/lighting.usda
+  semantics.usda
+  scene_manifest.json
+  build_report.json
+```
+
+The Gaussian environment is intentionally not a collider. Omniverse RTX renders the standard OpenUSD `UsdVol.ParticleField3DGaussianSplat` alongside polygonal objects; separate meshes provide PhysX contacts, depth/shadow proxies, and object manipulation.
+
+### Input quality tiers
+
+- **RGB-D/LiDAR:** production path. A configured nvblox runner fuses metric static geometry and emits `depth_validation.json`.
+- **RGB-only:** COLMAP + OpenMVS path. After reconstruct, `align-floor` (also run automatically by `build-usd`) fits a floor plane and stores a rigid COLMAP→USD transform (Z-up, floor at Z=0, unit scale). In Isaac, that Z=0 plane is the ground (gravity −Z); there is no separate Kit ground collider. Production remains blocked until `apply-metric-scale` or `set-metric-transform` approves true metric scale.
+- **One-pass capture:** preview quality when an object hides unobserved background.
+- **Clean plate/object detail passes:** production path for ghost-free removal and complete object geometry.
+
+A generic RGB video cannot guarantee metric, watertight geometry. The manifest records confidence and the production builder fails instead of silently inventing physics.
+
+### External runner contracts
+
+Heavy runtimes stay isolated and are configured under `external`:
+
+- `grut_root` points to NVIDIA 3DGRUT v1.1+; `grut_python` runs `train.py`.
+- `sam2_runner` receives `--images`, `--proposals`, `--output`, `--mask-format foreground-white`; it writes `<output>/<instance_id>/<frame>.png`.
+- `object_reconstruction_runner` receives `--images`, `--masks`, `--colmap`, `--instance-id`, `--output-mesh`, `--texture-resolution`, and optional `--detail-capture`; it writes a textured OBJ (or one PLY fallback).
+- `nvblox` receives `--input-manifest`, `--output-mesh`, `--validation-report`, `--voxel-size`, sensor paths, and `--static-only`.
+- OpenMVS uses `InterfaceCOLMAP`, `DensifyPointCloud`, `ReconstructMesh`, and `RefineMesh`.
+- `isaac_python` points to Isaac Sim 6.x `python.sh`.
+
+Run `scan2usd doctor configs/example_scene.yaml` before building.
+
+### Build and review
+
+```bash
+scan2usd reconstruct configs/example_scene.yaml
+scan2usd init-usd configs/example_scene.yaml --mode production
+scan2usd segment-usd configs/example_scene.yaml
+scan2usd review configs/example_scene.yaml
+
+# RGB-only: estimate floor plane → Z-up alignment (scale stays 1 until a metric anchor).
+scan2usd align-floor configs/example_scene.yaml
+
+# Remove stray Gaussians from the environment ParticleField (no retrain).
+# Primary knob: reconstruction.splat_cleanup.outlier_std (higher = keep more floaters).
+# Re-runs from environment_splat_raw.usd so you can tune and re-package quickly.
+scan2usd cleanup-splat configs/example_scene.yaml
+# scan2usd cleanup-splat configs/example_scene.yaml --outlier-std 3.0
+
+# Metric scale: measure a known length, then compose scale onto the floor transform.
+scan2usd apply-metric-scale configs/example_scene.yaml \
+  --known-length-m 0.91 --source-length 2.45 --reviewer NAME
+# Or: scan2usd apply-metric-scale configs/example_scene.yaml --meters-per-unit 0.37 --reviewer NAME
+# Or approve a full 4×4 JSON directly:
+# scan2usd set-metric-transform configs/example_scene.yaml transform.json --reviewer NAME
+
+# After packaging, Isaac ground is USD Z=0 (from align-floor). The viewer draws a
+# translucent non-colliding marker there by default (`--no-ground-marker` to hide).
+# workspace/isaac_env/bin/python tools/isaac/view_scene.py --stage workspace/usd/scene.usd
+
+# Resumable; pauses at required human gates.
+scan2usd build-usd configs/example_scene.yaml
+scan2usd review configs/example_scene.yaml
+scan2usd build-usd configs/example_scene.yaml
+
+# Compare Isaac renders at held-out cameras and run headless physics tests.
+scan2usd validate-usd configs/example_scene.yaml \
+  --held-out-renders workspace/isaac_heldout_renders
+```
+
+Focused commands (`build-visual-usd`, `cleanup-splat`, `build-static-usd`, `build-object-usd`, `build-materials-usd`, `build-lighting-usd`, and `package-usd`) expose individual stages for debugging.
+
+Live status (done / pending / next focus) for the hybrid kitchen scene is in
+[`docs/STATUS_HYBRID_USD.md`](STATUS_HYBRID_USD.md).
+
+### Environment splat quality (3DGRUT)
+
+**Config tiers:** use **`configs/high_quality_scene.yaml`** for final hybrid USD builds
+(50k iters, full-res COLMAP via `process_data.num_downscales: 1`, densify/SSIM/SH
+overrides). It is a drop-in replacement for `configs/example_scene.yaml` (same workspace
+paths). Use **`configs/example_scene.yaml`** for day-to-day work (currently also 50k-capable
+but `num_downscales: 2` to save disk/VRAM). For quick pipeline checks, set
+**`grut_max_iterations: 5000`** (preview — often soft / under-densified).
+
+- **`grut_max_iterations: 5000`** — fast preview; often soft / under-densified.
+- **`grut_max_iterations: 30000`** — production-ish sharpness (much slower). Match
+  `scheduler.positions.max_steps` via `grut_overrides` so the LR schedule finishes.
+- **`configs/high_quality_scene.yaml`** — 50k + held-out 5% + splat cleanup; see file for
+  full `grut_overrides`. Rebuild with:
+  `scan2usd build-visual-usd configs/high_quality_scene.yaml`.
+- Approved **movable** objects are **masked out** of the environment ParticleField on
+  purpose (hybrid design). They appear as separate object meshes. Holes behind them
+  need `capture.clean_plate_dir`, not longer training.
+- Extra Hydra knobs (densify, SH, loss) go in `reconstruction.grut_overrides`:
+
+```yaml
+reconstruction:
+  grut_max_iterations: 30000
+  held_out_ratio: 0.05
+  grut_overrides:
+    - scheduler.positions.max_steps=30000
+    - strategy.densify.end_iteration=15000
+```
+
+Rebuild the visual layer after changing these:
+
+```bash
+scan2usd build-visual-usd configs/example_scene.yaml
+scan2usd package-usd configs/example_scene.yaml
+```
+
+### Accuracy vs sharpness levers
+
+**Accuracy** (pose, floor/gravity, metric sizes, collision vs visual):
+
+1. `apply-metric-scale` with a measured length (biggest Isaac physics gap).
+2. Keep `align-floor`; re-run if COLMAP changes. Do not mix Nerfstudio normalizing
+   transforms with the floor `T`.
+3. Dense static mesh baked once under the current metric `T` (identity parent xform).
+4. Clean plate + detail object captures so manipulables match size/pose.
+5. `validate-usd` once metric; tighten `qa.max_registration_error_m`.
+
+**Sharpness** (ParticleField look):
+
+1. Train with `configs/high_quality_scene.yaml` (SH ramp every 500 steps +
+   `num_downscales: 1` — may need re-preprocess for full-res COLMAP).
+2. More iterations / densify help up to ~50k; gains diminish after that.
+3. Capture quality (less blur, more overlap, better lighting).
+4. `splat_cleanup.outlier_std`: higher keeps fine haze, more floaters; lower cleans
+   more aggressively.
+5. Movables are masked from the env splat — sharpen those via object meshes, not
+   longer environment training.
+
+### Review gates
+
+The local `scan2usd review` app:
+
+1. shows propagated instance masks over real frames;
+2. allows corrected foreground-white masks to be imported;
+3. confirms class, movable/static status, background coverage, and physical template;
+4. approves generated geometry, PBR estimates, physical properties, and lighting.
+
+Production consumers only read the approved `scene_manifest.json`.
+
+### Appearance and lighting
+
+- `look=baked` uses capture-matched emissive texture. It is useful for static appearance comparison, but captured shadows move with the object.
+- `look=pbr` uses a conservative de-lit base-color estimate plus normal, roughness, and metalness maps. This is the default for moving objects and must be reviewed.
+- The ParticleField contains captured radiance. RTX can render it with mesh shadows/reflections, but it is not a fully relightable PBR surface.
+
+### Validation
+
+`validate-usd` writes `build_report.json` and refuses a production pass when required checks fail:
+
+- root USD composition, assets, meters, Z-up, ParticleField schema, and physics schemas;
+- COLMAP/splat-to-proxy registration and RGB-D depth-to-collider error;
+- manifold/UV object geometry, collider complexity, material files, and physical properties;
+- hidden-background coverage/clean-plate evidence;
+- held-out PSNR, SSIM, and optional LPIPS reports;
+- Isaac headless static raycast, drop/rest, push, and kinematic pick/carry/place smoke tests.
+
+---
+
+## Legacy synthetic-YOLO pipeline overview
 
 ```text
 video / frames
@@ -367,12 +547,16 @@ scan2usd reconstruct configs/example_scene.yaml [OPTIONS]
 | `--skip-process-data` | flag | off | Reuse existing `nerfstudio_data_dir/colmap/sparse/0`; skip `ns-process-data`. |
 | `--max-iterations` | int or omit | YAML `splatfacto.max_num_iterations` | Override training length. |
 | `--viewer` | flag | off | Enable Nerfstudio live Web viewer during training (noisier logs). |
+| `--video-stride` | int | `15` | When auto-extracting from `video_path`: keep every Nth sharp frame. `1` = all (slow COLMAP); `15`–`30` is typical for ~30 fps video. |
+| `--video-max-frames` | int | `600` | Cap auto-extracted frames (`0` = no cap). Avoids 10k+ near-duplicate frames that often yield almost no COLMAP registrations. |
 
 **Frame input:**
 
 1. If `frames_dir` has images → use them.
-2. Else if `video_path` exists → extract **every** frame (stride 1, default blur filter) into `frames_dir`.
+2. Else if `video_path` exists → extract with `--video-stride` and `--video-max-frames` into `frames_dir` (not every frame by default).
 3. Else → error (run `preprocess` first).
+
+For full control (blur filter + `keyframe_every`), use `scan2usd preprocess` before `reconstruct`.
 
 **Subprocess behavior:**
 
@@ -404,7 +588,7 @@ scan2usd reconstruct configs/example_scene.yaml --skip-process-data
 
 ### `scan2usd view`
 
-**Purpose:** Open trained Splatfacto in Nerfstudio Web viewer (`ns-viewer`).
+**Purpose:** Open trained Splatfacto in Nerfstudio Web viewer (`ns-viewer`). By default, overlays wireframe **3D bounding boxes** from `workspace/objects_3d.npz` (same world frame as the splat; run `scan2usd lift` first).
 
 ```bash
 scan2usd view configs/example_scene.yaml [OPTIONS]
@@ -413,10 +597,14 @@ scan2usd view configs/example_scene.yaml [OPTIONS]
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--load-config` | path | see below | `config.yml` from a training run. |
+| `--boxes` / `--no-boxes` | flag | `--boxes` | Draw lifted AABBs in the viewer (viser wireframes). |
+| `--objects-npz` | path | `workspace/objects_3d.npz` | NPZ from `scan2usd lift`. |
 
 **Config resolution:** `--load-config` → else `splat_config_path` in YAML → else newest `workspace/ns_outputs/<experiment_name>/splatfacto/*/config.yml`.
 
-Open the printed URL (usually **http://localhost:7007**).
+Open the printed URL (usually **http://localhost:7007**). Use the **Show 3D boxes** checkbox in the sidebar to toggle box visibility.
+
+3D boxes are overlaid in the **trained splat coordinate frame**, then scaled to match Nerfstudio's viser scene (×10, same as camera frustums). The NPZ stores ``transforms.json`` / ``sparse_pc.ply`` coordinates for synthesis. Re-run ``scan2usd view`` after upgrading (``lift`` only if boxes themselves changed).
 
 ---
 
@@ -440,17 +628,60 @@ scan2usd label configs/example_scene.yaml [OPTIONS]
 
 ### `scan2usd lift`
 
-**Purpose:** Fuse 2D boxes + COLMAP point cloud into merged 3D axis-aligned bounding boxes.
+**Purpose:** Fuse 2D YOLO boxes with sparse SfM points into merged 3D axis-aligned bounding boxes.
 
 ```bash
 scan2usd lift configs/example_scene.yaml
 ```
 
-**Requires:** `colmap_txt_dir/` from `reconstruct`, `labels_real/` from `label`.
+**Requires:** `labels_real/` from `label`, and `nerfstudio_data_dir/` with `transforms.json` + `sparse_pc.ply` from `reconstruct`.
 
-**Output:** `workspace/objects_3d.npz` with arrays `class_id`, `bbox_min`, `bbox_max`.
+**Output:** `workspace/objects_3d.npz` (`class_id`, `bbox_min`, `bbox_max`, `obb_center`, `obb_half`, `obb_rotation`, `coord_frame=nerfstudio`). Boxes are **oriented** (PCA on SfM points per detection), not world-axis cubes. The viewer maps them into the splat frame and draws wireframes at Nerfstudio's viser scale (×10).
 
-**Config:** `lift.min_points_in_box`, `lift.merge_center_dist_m`.
+**Config:** `lift.min_points_in_box`, `lift.merge_center_dist_m`, `lift.depth_trim_mad`, `lift.percentile`, optional `lift.max_extent_m`.
+
+#### How lift works (coordinate frames)
+
+```text
+2D YOLO label on frame
+    → find sparse SfM points from sparse_pc.ply projecting inside the 2D rectangle
+    → depth-trim points along the viewing ray (drop background outliers)
+    → fit oriented 3D box (PCA or view-aligned: camera + scene “up” + 2D box aspect)
+    → merge nearby same-class boxes across frames
+    → save objects_3d.npz in transforms.json / sparse_pc.ply space
+
+scan2usd view
+    → load splat checkpoint + dataparser (orient / center / scale)
+    → map boxes to viewer coords (orient-only, not double applied_transform)
+    → multiply by Nerfstudio viser scale (×10) and draw wireframes
+```
+
+**Important:** `view` can look wrong even when lift is OK. Always debug lift on **real 2D images** first.
+
+#### `scan2usd debug-lift`
+
+Writes per-detection **side-by-side** images under `workspace/lift_debug/`:
+
+| Panel | Meaning |
+|-------|---------|
+| **Left** | YOLO pseudo-label only (reference — usually better) |
+| **Right** | 3D lift for **that** detection only (not merged) |
+| **Cyan** (right) | Sparse SfM points inside the 2D box |
+| **Red rect** (right) | 3D AABB reprojected (IoU metric) |
+| **Blue hull** (right) | Oriented 3D box reprojected |
+
+```bash
+scan2usd debug-lift configs/example_scene.yaml
+# optional: --max-frames 24 --frame-stride 15 --out-dir workspace/lift_debug
+```
+
+Read `workspace/lift_debug/summary.json` — field `iou_reproj` (median should be ~0.3+ if lift is sane for that frame).
+
+| Symptom | Likely cause |
+|---------|----------------|
+| Right panel nowhere near left (YOLO) | Lift / sparse points (walls along ray, huge `n_sfm_inliers`) |
+| Right hugs left in debug, wrong in `view` | Dataparser or viser ×10 transform |
+| YOLO good, lift bad (your case) | Expected with sparse SfM; tune `inner_margin_frac`, `depth_trim_mad`, lower `merge_center_dist_m` |
 
 ---
 
@@ -648,6 +879,8 @@ TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 ns-render interpolate \
 | `torch.load` / `weights_only` error in `ns-viewer` | Use `scan2usd view` or `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1`. |
 | Noisy training log spam | Default fixed (`max-log-size 0`); avoid `--viewer` unless needed. |
 | COLMAP low % registered | More overlap, slower motion, more texture; fewer blurry frames (`preprocess` stride). |
+| COLMAP registered ≈0% after long video | Too many near-duplicate frames: use `reconstruct --video-stride 15 --video-max-frames 600` or `preprocess --stride …` then `reconstruct`. |
+| `CUDA error: invalid argument` early in `ns-train` | Fix COLMAP first (need many registered views). Reboot; `nvidia-smi`; try `CUDA_LAUNCH_BLOCKING=1`; update driver / PyTorch+CUDA stack for RTX 50. |
 | Dark / inconsistent regions in splat | `use_bilateral_grid: true`, locked exposure on re-capture; see `splatfacto` table. |
 | OOM during training | `camera_res_scale_factor: 0.5`, higher `process_data.num_downscales`, fewer frames. |
 | `synthesize` skips render | Set `splat_config_path` to trained `config.yml`. |

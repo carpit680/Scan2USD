@@ -7,6 +7,7 @@ import numpy as np
 import typer
 
 from scan2usd.cleanup import CleanTierEnum, run_cleanup
+from scan2usd.debug_lift import run_lift_debug
 from scan2usd.config import SceneConfig
 from scan2usd.eval.benchmark import compare_abc, run_experiment
 from scan2usd.export_dataset import (
@@ -19,6 +20,7 @@ from scan2usd.labeling.detect import run_pseudo_labeling
 from scan2usd.labeling.lift import lift_scene
 from scan2usd.preprocess.video import (
     VIDEO_SUFFIXES,
+    clear_frame_images,
     extract_frames,
     frames_dir_has_images,
     is_supported_video_suffix,
@@ -33,6 +35,7 @@ from scan2usd.reconstruction.nerfstudio import (
     ns_render_camera_path,
     ns_train_splatfacto,
     ns_viewer,
+    ns_viewer_with_boxes,
 )
 from scan2usd.synthetic.poses import sample_novel_poses, write_nerfstudio_camera_path
 from scan2usd.synthetic.transforms_io import find_transforms_json, load_transforms_json
@@ -81,20 +84,55 @@ def reconstruct(
         False,
         help="Enable Nerfstudio's live Web viewer during ``ns-train`` (noisier terminal output).",
     ),
+    video_stride: int = typer.Option(
+        15,
+        "--video-stride",
+        help="When auto-extracting from ``video_path`` (empty frames_dir): keep every Nth sharp frame. "
+        "Use 1 for dense sampling (slow COLMAP); 15–30 is typical for 30fps walk-around video.",
+    ),
+    video_max_frames: int = typer.Option(
+        600,
+        "--video-max-frames",
+        help="Cap frames when auto-extracting from video (0 = no cap). Prevents 10k+ near-duplicate "
+        "frames that break COLMAP.",
+    ),
+    force: bool = typer.Option(
+        False,
+        help="Re-extract frames from video into frames_dir (overwrite existing JPEGs) and re-run "
+        "ns-process-data. Requires video_path.",
+    ),
 ) -> None:
     """``ns-process-data`` → optional ``ns-train splatfacto``; export COLMAP TXT for lifting."""
     cfg = SceneConfig.load(config)
-    if not frames_dir_has_images(cfg.frames_dir):
-        if cfg.video_path and Path(cfg.video_path).is_file():
-            typer.echo(f"No frames under {cfg.frames_dir}; extracting from {cfg.video_path} …")
-            cfg.frames_dir.mkdir(parents=True, exist_ok=True)
-            extract_frames(Path(cfg.video_path), cfg.frames_dir)
-        else:
+    need_extract = force or not frames_dir_has_images(cfg.frames_dir)
+    if need_extract:
+        if not (cfg.video_path and Path(cfg.video_path).is_file()):
+            if force:
+                raise typer.BadParameter(
+                    "reconstruct --force requires a valid video_path to re-extract frames"
+                )
             raise typer.BadParameter(
                 f"Missing or empty frames_dir: {cfg.frames_dir}. "
                 "Run `scan2usd preprocess …` or set video_path to a valid file."
             )
+        cap = None if video_max_frames == 0 else video_max_frames
+        cfg.frames_dir.mkdir(parents=True, exist_ok=True)
+        if force and frames_dir_has_images(cfg.frames_dir):
+            removed = clear_frame_images(cfg.frames_dir)
+            typer.echo(f"Force: cleared {removed} existing frames under {cfg.frames_dir}")
+        typer.echo(
+            f"{'Re-extracting' if force else 'Extracting'} from {cfg.video_path} "
+            f"(stride={video_stride}, max_frames={cap}) …"
+        )
+        extract_frames(
+            Path(cfg.video_path),
+            cfg.frames_dir,
+            stride=video_stride,
+            max_frames=cap,
+        )
     if skip_process_data:
+        if force:
+            raise typer.BadParameter("Cannot combine --force with --skip-process-data")
         sparse = find_ns_colmap_sparse(cfg.nerfstudio_data_dir)
         if sparse is None:
             raise typer.BadParameter(
@@ -146,17 +184,84 @@ def lift(
     """Lift 2D labels + COLMAP points → merged 3D AABBs (``workspace/objects_3d.npz``)."""
     cfg = SceneConfig.load(config)
     labels_dir = cfg.workspace_dir / "labels_real"
-    min_p = int(cfg.lift.get("min_points_in_box", 8))
-    merge_d = float(cfg.lift.get("merge_center_dist_m", 0.35))
-    objs = lift_scene(cfg.colmap_txt_dir, labels_dir, min_points=min_p, merge_center_dist_m=merge_d)
+    lift_cfg = cfg.lift or {}
+    min_p = int(lift_cfg.get("min_points_in_box", 8))
+    merge_d = float(lift_cfg.get("merge_center_dist_m", 0.6))
+    depth_mad = float(lift_cfg.get("depth_trim_mad", 3.0))
+    inner_margin = float(lift_cfg.get("inner_margin_frac", 0.12))
+    dp = lift_cfg.get("depth_percentile", [10.0, 90.0])
+    depth_percentile = None if dp is None else (float(dp[0]), float(dp[1]))
+    pct = lift_cfg.get("percentile", [5.0, 95.0])
+    percentile = (float(pct[0]), float(pct[1]))
+    max_ext = lift_cfg.get("max_extent_m")
+    max_extent_m = None if max_ext is None else float(max_ext)
+    objs = lift_scene(
+        cfg.colmap_txt_dir,
+        labels_dir,
+        min_points=min_p,
+        merge_center_dist_m=merge_d,
+        ns_data_dir=cfg.nerfstudio_data_dir,
+        depth_trim_mad=depth_mad,
+        inner_margin_frac=inner_margin,
+        depth_percentile=depth_percentile,
+        percentile=percentile,
+        max_extent_m=max_extent_m,
+    )
     out = cfg.workspace_dir / "objects_3d.npz"
     if not objs:
         typer.echo("No 3D objects lifted; check labels and COLMAP.")
         return
     cls = np.array([o.class_id for o in objs], dtype=np.int32)
     bb = np.stack([o.bbox for o in objs], axis=0)
-    np.savez(out, class_id=cls, bbox_min=bb[:, 0], bbox_max=bb[:, 1])
-    typer.echo(f"Saved {len(objs)} objects to {out}")
+    np.savez(
+        out,
+        class_id=cls,
+        bbox_min=bb[:, 0],
+        bbox_max=bb[:, 1],
+        obb_center=np.stack([o.center for o in objs], axis=0),
+        obb_half=np.stack([o.half_extents for o in objs], axis=0),
+        obb_rotation=np.stack([o.rotation for o in objs], axis=0),
+        coord_frame=np.array("nerfstudio"),
+    )
+    typer.echo(f"Saved {len(objs)} objects to {out} (transforms.json / sparse_pc frame)")
+
+
+@app.command("debug-lift")
+def debug_lift(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+    out_dir: Optional[Path] = typer.Option(
+        None,
+        "--out-dir",
+        help="Output folder (default: ``<workspace>/lift_debug``).",
+    ),
+    max_frames: int = typer.Option(16, help="Max labeled frames to export overlays for."),
+    frame_stride: int = typer.Option(
+        25,
+        help="Step through ``transforms.json`` frames (higher = fewer images).",
+    ),
+) -> None:
+    """
+    Debug 2D→3D lift: side-by-side YOLO (left) vs per-detection 3D lift (right).
+
+    Use this to see whether orientation errors come from lift geometry or from the splat viewer transform.
+    """
+    cfg = SceneConfig.load(config)
+    out = out_dir if out_dir is not None else cfg.workspace_dir / "lift_debug"
+    lift_cfg = cfg.lift or {}
+    dp = lift_cfg.get("depth_percentile", [10.0, 90.0])
+    depth_percentile = None if dp is None else (float(dp[0]), float(dp[1]))
+    path = run_lift_debug(
+        cfg,
+        out,
+        max_frames=max_frames,
+        frame_stride=frame_stride,
+        min_points=int(lift_cfg.get("min_points_in_box", 8)),
+        depth_trim_mad=float(lift_cfg.get("depth_trim_mad", 3.0)),
+        inner_margin_frac=float(lift_cfg.get("inner_margin_frac", 0.12)),
+        depth_percentile=depth_percentile,
+    )
+    typer.echo(f"Wrote lift debug artifacts to {path}")
+    typer.echo(f"  Open images in {path} and read {path / 'summary.json'} (median IoU in summary).")
 
 
 @app.command()
@@ -167,6 +272,16 @@ def view(
         "--load-config",
         help="Path to Nerfstudio ``config.yml`` (default: ``splat_config_path`` or latest under ``ns_outputs``).",
     ),
+    show_boxes: bool = typer.Option(
+        True,
+        "--boxes/--no-boxes",
+        help="Overlay lifted 3D AABBs from ``workspace/objects_3d.npz`` (run ``scan2usd lift`` first).",
+    ),
+    objects_npz: Optional[Path] = typer.Option(
+        None,
+        "--objects-npz",
+        help="Path to ``objects_3d.npz`` (default: ``<workspace>/objects_3d.npz``).",
+    ),
 ) -> None:
     """Open the trained Splatfacto scene in Nerfstudio's Web viewer (``ns-viewer``)."""
     cfg = SceneConfig.load(config)
@@ -176,6 +291,18 @@ def view(
             "No splat ``config.yml`` found. Run ``scan2usd reconstruct`` first, set ``splat_config_path`` "
             "in YAML, or pass ``--load-config``."
         )
+    npz = objects_npz if objects_npz is not None else cfg.workspace_dir / "objects_3d.npz"
+    if show_boxes:
+        if not npz.is_file():
+            typer.echo(
+                f"No {npz}; open viewer without boxes (run ``scan2usd lift`` first, or use ``--no-boxes``).",
+                err=True,
+            )
+            show_boxes = False
+        else:
+            typer.echo(f"Loading {ckpt} with {len(np.load(npz)['class_id'])} 3D boxes …")
+            ns_viewer_with_boxes(cfg, ckpt, npz)
+            return
     typer.echo(f"Loading {ckpt} (open the HTTP URL printed below in your browser) …")
     ns_viewer(cfg, ckpt)
 
@@ -241,10 +368,39 @@ def synthesize(
         z = np.load(objs_npz)
         from scan2usd.labeling.lift import Object3D
 
-        objs = [
-            Object3D(int(c), np.stack([lo, hi], axis=0))
-            for c, lo, hi in zip(z["class_id"], z["bbox_min"], z["bbox_max"])
-        ]
+        if "obb_center" in z:
+            objs = [
+                Object3D(
+                    int(c),
+                    np.stack([lo, hi], axis=0),
+                    center=ctr,
+                    rotation=rot,
+                    half_extents=half,
+                    points=np.empty((0, 3)),
+                    view_origin=ctr,
+                )
+                for c, lo, hi, ctr, rot, half in zip(
+                    z["class_id"],
+                    z["bbox_min"],
+                    z["bbox_max"],
+                    z["obb_center"],
+                    z["obb_rotation"],
+                    z["obb_half"],
+                )
+            ]
+        else:
+            objs = [
+                Object3D(
+                    int(c),
+                    np.stack([lo, hi], axis=0),
+                    center=(lo + hi) / 2,
+                    rotation=np.eye(3),
+                    half_extents=(hi - lo) / 2,
+                    points=np.empty((0, 3)),
+                    view_origin=(lo + hi) / 2,
+                )
+                for c, lo, hi in zip(z["class_id"], z["bbox_min"], z["bbox_max"])
+            ]
         lbl_dir = cfg.workspace_dir / "labels_synthetic"
         write_synthetic_labels(objs, poses, meta, w, h, lbl_dir)
         typer.echo(f"Synthetic labels in {lbl_dir}")
@@ -348,6 +504,462 @@ def benchmark(
     if ex_key == "all":
         summary = compare_abc(reports)
         typer.echo(summary)
+
+
+@app.command("init-usd")
+def init_usd(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+    mode: str = typer.Option("production", help="production | preview"),
+) -> None:
+    """Create the versioned scene manifest and resumable USD build state."""
+    from scan2usd.pipeline.orchestrator import PipelineOrchestrator
+
+    cfg = SceneConfig.load(config)
+    orchestrator = PipelineOrchestrator(cfg, config, build_mode=mode)
+    typer.echo(orchestrator.manifest_path)
+
+
+@app.command("segment-usd")
+def segment_usd(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+    mode: str = typer.Option("production", help="production | preview"),
+    force: bool = typer.Option(False, help="Re-run proposal and mask stages"),
+) -> None:
+    """Propose object instances and run the configured SAM2 mask propagator."""
+    from scan2usd.pipeline.orchestrator import PipelineOrchestrator
+
+    cfg = SceneConfig.load(config)
+    orchestrator = PipelineOrchestrator(cfg, config, build_mode=mode)
+    orchestrator.segment(force=force)
+    typer.echo(f"Masks ready; review {orchestrator.manifest_path}")
+
+
+@app.command("review")
+def review_usd(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+    share: bool = typer.Option(False, help="Ask Gradio for a public share URL"),
+) -> None:
+    """Review/correct masks and approve objects, generated assets, and lighting."""
+    from scan2usd.review.app import launch_review_app
+
+    cfg = SceneConfig.load(config)
+    manifest_path = cfg.workspace_dir / "scene_manifest.json"
+    if not manifest_path.is_file():
+        raise typer.BadParameter(f"Missing {manifest_path}; run scan2usd init-usd first")
+    launch_review_app(cfg, manifest_path, share=share)
+
+
+@app.command("align-floor")
+def align_floor(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+    mode: str = typer.Option("preview", help="production | preview"),
+    force: bool = typer.Option(False, help="Re-estimate even if a transform already exists"),
+    distance_thresh: float = typer.Option(
+        0.04,
+        help="RANSAC inlier distance in COLMAP units",
+    ),
+) -> None:
+    """
+    Estimate the floor plane from COLMAP points and build COLMAP→USD alignment.
+
+    Rotates so the floor normal is +Z and translates so the floor is at Z=0.
+    Scale stays 1.0 until a metric length is approved via apply-metric-scale
+    or set-metric-transform.
+    Run this after reconstruct / before build-usd packaging (build-usd also runs it).
+    """
+    from scan2usd.pipeline.orchestrator import PipelineOrchestrator
+
+    cfg = SceneConfig.load(config)
+    orchestrator = PipelineOrchestrator(cfg, config, build_mode=mode)
+    out = orchestrator.align_floor(force=force, distance_thresh=distance_thresh)
+    transform = next(
+        (
+            item
+            for item in orchestrator.manifest.transforms
+            if item.source_frame == "colmap_world" and item.target_frame == "usd_world_z_up_meters"
+        ),
+        None,
+    )
+    meta = orchestrator.manifest.artifact("floor_alignment")
+    if meta and meta.metadata:
+        typer.echo(
+            "Floor inliers="
+            f"{meta.metadata.get('inliers')}/{meta.metadata.get('point_count')} "
+            f"({float(meta.metadata.get('inlier_ratio', 0)):.1%})"
+        )
+    if transform is not None:
+        typer.echo(f"Confidence={transform.confidence:.3f} evidence={transform.evidence}")
+    typer.echo(f"Wrote {out}")
+
+
+@app.command("set-metric-transform")
+def set_metric_transform(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+    transform_json: Path = typer.Argument(..., exists=True, dir_okay=False),
+    reviewer: str = typer.Option(..., help="Person approving this metric registration"),
+) -> None:
+    """Approve a COLMAP→USD 4×4 similarity transform (Z-up, meters)."""
+    import json
+
+    from scan2usd.geometry.frames import (
+        FRAME_COLMAP,
+        FRAME_USD,
+        uniform_scale,
+        validate_similarity,
+    )
+    from scan2usd.pipeline.manifest import ScaleEvidence, SceneManifest, TransformRecord
+
+    cfg = SceneConfig.load(config)
+    manifest_path = cfg.workspace_dir / "scene_manifest.json"
+    manifest = SceneManifest.load(manifest_path)
+    raw = json.loads(transform_json.read_text(encoding="utf-8"))
+    matrix = raw.get("colmap_to_usd") if isinstance(raw, dict) else raw
+    confidence = float(raw.get("registration_confidence", 1.0)) if isinstance(raw, dict) else 1.0
+    value = validate_similarity(matrix)
+    scale = uniform_scale(value)
+    manifest.transforms = [
+        item
+        for item in manifest.transforms
+        if not (
+            item.source_frame == FRAME_COLMAP and item.target_frame == FRAME_USD
+        )
+    ]
+    manifest.transforms.append(
+        TransformRecord(
+            source_frame=FRAME_COLMAP,
+            target_frame=FRAME_USD,
+            matrix=value.tolist(),
+            confidence=confidence,
+            evidence=str(transform_json.resolve()),
+        )
+    )
+    manifest.scale = ScaleEvidence(
+        method="approved_similarity_registration",
+        meters_per_source_unit=scale,
+        confidence=confidence,
+        reference=str(transform_json.resolve()),
+        approved=True,
+    )
+    manifest.approve("metric_transform", reviewer=reviewer)
+    manifest.save(manifest_path)
+    typer.echo(f"Approved scale: {scale:.9g} meters/source-unit")
+
+
+@app.command("apply-metric-scale")
+def apply_metric_scale(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+    reviewer: str = typer.Option(..., help="Person approving this metric registration"),
+    meters_per_unit: float | None = typer.Option(
+        None,
+        help="Meters per COLMAP/source unit (after floor alignment)",
+    ),
+    known_length_m: float | None = typer.Option(
+        None,
+        help="Real-world length in meters of a measured edge",
+    ),
+    source_length: float | None = typer.Option(
+        None,
+        help="Same edge length in current floor-aligned scene/COLMAP units",
+    ),
+    floor_json: Path | None = typer.Option(
+        None,
+        exists=True,
+        dir_okay=False,
+        help="Optional floor COLMAP→USD JSON (default: workspace/colmap_to_usd_floor.json)",
+    ),
+    output: Path | None = typer.Option(
+        None,
+        help="Where to write the metric transform JSON (default: workspace/colmap_to_usd_metric.json)",
+    ),
+) -> None:
+    """
+    Compose uniform metric scale onto the floor COLMAP→USD transform and approve it.
+
+    Provide either --meters-per-unit, or both --known-length-m and --source-length.
+    Rebuild baked meshes and re-run package-usd after approving so collision matches.
+    """
+    from scan2usd.geometry.frames import FRAME_COLMAP, FRAME_USD, uniform_scale
+    from scan2usd.geometry.metric_scale import (
+        apply_uniform_metric_scale,
+        load_colmap_to_usd_matrix,
+        meters_per_unit_from_lengths,
+        resolve_floor_transform_path,
+        write_metric_transform_json,
+    )
+    from scan2usd.pipeline.manifest import ScaleEvidence, SceneManifest, TransformRecord
+
+    if meters_per_unit is not None and (known_length_m is not None or source_length is not None):
+        raise typer.BadParameter("Use either --meters-per-unit or --known-length-m/--source-length")
+    if meters_per_unit is None:
+        if known_length_m is None or source_length is None:
+            raise typer.BadParameter(
+                "Provide --meters-per-unit, or both --known-length-m and --source-length"
+            )
+        meters_per_unit = meters_per_unit_from_lengths(
+            known_length_m=known_length_m,
+            source_length=source_length,
+        )
+    if meters_per_unit <= 0:
+        raise typer.BadParameter("--meters-per-unit must be positive")
+
+    cfg = SceneConfig.load(config)
+    manifest_path = cfg.workspace_dir / "scene_manifest.json"
+    if not manifest_path.is_file():
+        raise typer.BadParameter(f"Missing {manifest_path}; run scan2usd init-usd first")
+    manifest = SceneManifest.load(manifest_path)
+
+    source_path = (
+        floor_json
+        if floor_json is not None
+        else resolve_floor_transform_path(cfg.workspace_dir, manifest.transforms)
+    )
+    base = load_colmap_to_usd_matrix(source_path)
+    metric = apply_uniform_metric_scale(base, meters_per_unit)
+    out_path = output or (cfg.workspace_dir / "colmap_to_usd_metric.json")
+    if known_length_m is not None and source_length is not None:
+        evidence = (
+            f"known_length_m={known_length_m}; source_length={source_length}; "
+            f"floor={source_path.resolve()}"
+        )
+        method = "floor_alignment_plus_measured_length"
+    else:
+        evidence = f"meters_per_unit={meters_per_unit}; floor={source_path.resolve()}"
+        method = "floor_alignment_plus_meters_per_unit"
+
+    write_metric_transform_json(
+        metric,
+        out_path,
+        meters_per_source_unit=meters_per_unit,
+        method=method,
+        evidence=evidence,
+        confidence=0.9,
+    )
+
+    scale = uniform_scale(metric)
+    manifest.transforms = [
+        item
+        for item in manifest.transforms
+        if not (item.source_frame == FRAME_COLMAP and item.target_frame == FRAME_USD)
+    ]
+    manifest.transforms.append(
+        TransformRecord(
+            source_frame=FRAME_COLMAP,
+            target_frame=FRAME_USD,
+            matrix=metric.tolist(),
+            confidence=0.9,
+            evidence=str(out_path.resolve()),
+        )
+    )
+    manifest.scale = ScaleEvidence(
+        method=method,
+        meters_per_source_unit=scale,
+        confidence=0.9,
+        reference=str(out_path.resolve()),
+        approved=True,
+    )
+    manifest.approve("metric_transform", reviewer=reviewer)
+    manifest.save(manifest_path)
+    typer.echo(f"Wrote {out_path}")
+    typer.echo(f"Approved scale: {scale:.9g} meters/source-unit")
+    typer.echo("Rebuild baked geometry (objects/static) and package-usd so meshes match the new T.")
+
+
+@app.command("build-visual-usd")
+def build_visual_usd(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+) -> None:
+    """Build the masked static 3DGRUT ParticleField layer only."""
+    from scan2usd.pipeline.manifest import SceneManifest
+    from scan2usd.reconstruction.grut import export_environment_particlefield
+
+    cfg = SceneConfig.load(config)
+    manifest_path = cfg.workspace_dir / "scene_manifest.json"
+    manifest = SceneManifest.load(manifest_path)
+    output = export_environment_particlefield(cfg, manifest)
+    manifest.save(manifest_path)
+    typer.echo(output)
+
+
+@app.command("cleanup-splat")
+def cleanup_splat_cmd(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+    mode: str = typer.Option("preview", help="production | preview"),
+    force: bool = typer.Option(
+        False,
+        help="Re-run even if a cleanup report already exists (uses raw backup)",
+    ),
+    outlier_std: float | None = typer.Option(
+        None,
+        help="Override reconstruction.splat_cleanup.outlier_std for this run",
+    ),
+    min_opacity: float | None = typer.Option(
+        None,
+        help="Override reconstruction.splat_cleanup.min_opacity for this run",
+    ),
+) -> None:
+    """
+    Remove stray Gaussians from the environment ParticleField without retraining.
+
+    Uses reconstruction.splat_cleanup thresholds (outlier_std is the main knob).
+    Re-runs from environment_splat_raw.usd when present so you can tune thresholds.
+    """
+    from scan2usd.pipeline.orchestrator import PipelineOrchestrator
+
+    cfg = SceneConfig.load(config)
+    if outlier_std is not None:
+        cfg.reconstruction.splat_cleanup.outlier_std = float(outlier_std)
+    if min_opacity is not None:
+        cfg.reconstruction.splat_cleanup.min_opacity = float(min_opacity)
+    cfg.reconstruction.splat_cleanup.enabled = True
+    orchestrator = PipelineOrchestrator(cfg, config, build_mode=mode)
+    path = orchestrator.cleanup_splat(force=force)
+    report = cfg.workspace_dir / "build" / "visual" / "splat_cleanup_report.json"
+    if report.is_file():
+        import json
+
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        typer.echo(
+            "kept={kept}/{total} removed_spatial={spatial} removed_opacity={opacity} "
+            "outlier_std={std}".format(
+                kept=payload.get("kept_count"),
+                total=payload.get("input_count"),
+                spatial=payload.get("removed_spatial"),
+                opacity=payload.get("removed_opacity"),
+                std=payload.get("outlier_std"),
+            )
+        )
+    typer.echo(path)
+
+
+@app.command("build-static-usd")
+def build_static_usd(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+) -> None:
+    """Build metric static collision and shadow/depth proxy meshes only."""
+    from scan2usd.geometry.static_scene import build_static_scene
+    from scan2usd.pipeline.manifest import SceneManifest
+
+    cfg = SceneConfig.load(config)
+    manifest_path = cfg.workspace_dir / "scene_manifest.json"
+    manifest = SceneManifest.load(manifest_path)
+    outputs = build_static_scene(cfg, manifest, manifest_path=manifest_path)
+    manifest.save(manifest_path)
+    typer.echo(outputs)
+
+
+@app.command("build-object-usd")
+def build_object_usd(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+    instance_id: str = typer.Argument(...),
+) -> None:
+    """Reconstruct one approved rigid object and its collision source."""
+    from scan2usd.assets.object_builder import reconstruct_object
+    from scan2usd.pipeline.manifest import SceneManifest
+
+    cfg = SceneConfig.load(config)
+    manifest_path = cfg.workspace_dir / "scene_manifest.json"
+    manifest = SceneManifest.load(manifest_path)
+    outputs = reconstruct_object(cfg, manifest, instance_id)
+    manifest.save(manifest_path)
+    typer.echo(outputs)
+
+
+@app.command("build-materials-usd")
+def build_materials_usd(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+    instance_id: str = typer.Argument(...),
+) -> None:
+    """Build baked and PBR material variants for one reconstructed object."""
+    from scan2usd.assets.materials import build_object_materials
+    from scan2usd.pipeline.manifest import SceneManifest
+
+    cfg = SceneConfig.load(config)
+    manifest_path = cfg.workspace_dir / "scene_manifest.json"
+    manifest = SceneManifest.load(manifest_path)
+    outputs = build_object_materials(cfg, manifest, manifest.get_object(instance_id))
+    manifest.save(manifest_path)
+    typer.echo(outputs)
+
+
+@app.command("build-lighting-usd")
+def build_lighting_usd(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+) -> None:
+    """Estimate the reviewed RTX dome-light layer."""
+    from scan2usd.lighting.estimate import estimate_scene_lighting
+    from scan2usd.pipeline.manifest import SceneManifest
+
+    cfg = SceneConfig.load(config)
+    manifest_path = cfg.workspace_dir / "scene_manifest.json"
+    manifest = SceneManifest.load(manifest_path)
+    estimate, output = estimate_scene_lighting(cfg, manifest)
+    manifest.save(manifest_path)
+    typer.echo(f"{output} ({estimate.source}, confidence={estimate.confidence:.2f})")
+
+
+@app.command("package-usd")
+def package_usd(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+) -> None:
+    """Compose existing approved artifacts into the layered Isaac scene."""
+    from scan2usd.pipeline.manifest import SceneManifest
+    from scan2usd.usd.package import build_usd_package
+
+    cfg = SceneConfig.load(config)
+    manifest_path = cfg.workspace_dir / "scene_manifest.json"
+    manifest = SceneManifest.load(manifest_path)
+    root = build_usd_package(cfg, manifest)
+    manifest.save(manifest_path)
+    typer.echo(root)
+
+
+@app.command("build-usd")
+def build_usd(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+    mode: str = typer.Option("production", help="production | preview"),
+    force: bool = typer.Option(False, help="Re-run completed stages"),
+) -> None:
+    """Run/resume the complete hybrid Scan-to-USD build graph."""
+    from scan2usd.pipeline.orchestrator import PipelineOrchestrator, ReviewRequired
+
+    cfg = SceneConfig.load(config)
+    orchestrator = PipelineOrchestrator(cfg, config, build_mode=mode)
+    try:
+        root = orchestrator.build(force=force)
+    except ReviewRequired as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(root)
+
+
+@app.command("validate-usd")
+def validate_usd_cmd(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+    held_out_renders: Optional[Path] = typer.Option(
+        None,
+        exists=True,
+        file_okay=False,
+        help="Isaac renders for cameras listed in build/grut_dataset/held_out.json",
+    ),
+    isaac: bool = typer.Option(True, "--isaac/--no-isaac", help="Run headless Isaac physics tests"),
+) -> None:
+    """Run visual, registration, mesh, collision, and Isaac physics quality gates."""
+    from scan2usd.pipeline.manifest import SceneManifest
+    from scan2usd.usd.validate import validate_usd
+
+    cfg = SceneConfig.load(config)
+    manifest_path = cfg.workspace_dir / "scene_manifest.json"
+    manifest = SceneManifest.load(manifest_path)
+    try:
+        report = validate_usd(
+            cfg,
+            manifest,
+            held_out_render_dir=held_out_renders,
+            run_isaac=isaac,
+        )
+    finally:
+        manifest.save(manifest_path)
+    typer.echo(f"usable={report['usable']} report={cfg.usd.output_dir / 'build_report.json'}")
 
 
 @app.command()

@@ -6,6 +6,9 @@ from typing import Any
 
 import numpy as np
 
+COORD_FRAME_COLMAP = "colmap"
+COORD_FRAME_NERFSTUDIO = "nerfstudio"
+
 
 def load_transforms_json(path: Path) -> tuple[list[str], list[np.ndarray], dict[str, Any]]:
     """
@@ -79,3 +82,111 @@ def find_transforms_json(ns_data_dir: Path) -> Path | None:
         if p.is_file():
             return p
     return None
+
+
+def applied_transform_to_4x4(meta: dict[str, Any]) -> np.ndarray | None:
+    """Nerfstudio ``applied_transform`` (COLMAP → saved / viewer coordinates) as 4×4."""
+    raw = meta.get("applied_transform")
+    if raw is None:
+        return None
+    t = np.array(raw, dtype=np.float64)
+    if t.shape == (3, 4):
+        out = np.eye(4, dtype=np.float64)
+        out[:3, :4] = t
+        return out
+    if t.shape == (4, 4):
+        return t
+    raise ValueError(f"applied_transform has unexpected shape {t.shape}")
+
+
+def load_applied_transform(ns_data_dir: Path) -> np.ndarray | None:
+    """Load ``applied_transform`` from ``transforms.json`` under a Nerfstudio data dir."""
+    tjson = find_transforms_json(ns_data_dir)
+    if tjson is None:
+        return None
+    meta = json.loads(tjson.read_text())
+    return applied_transform_to_4x4(meta)
+
+
+def transform_points_colmap_to_nerfstudio(xyz: np.ndarray, transform_4x4: np.ndarray) -> np.ndarray:
+    """Apply Nerfstudio COLMAP→viewer transform to N×3 points."""
+    pts = np.asarray(xyz, dtype=np.float64)
+    r = transform_4x4[:3, :3]
+    t = transform_4x4[:3, 3]
+    return (pts @ r.T) + t
+
+
+def aabb_corners(bbox: np.ndarray) -> np.ndarray:
+    """Eight corners of axis-aligned bbox with shape (2, 3) min/max."""
+    lo, hi = bbox[0], bbox[1]
+    return np.array(
+        [
+            [lo[0], lo[1], lo[2]],
+            [hi[0], lo[1], lo[2]],
+            [lo[0], hi[1], lo[2]],
+            [hi[0], hi[1], lo[2]],
+            [lo[0], lo[1], hi[2]],
+            [hi[0], lo[1], hi[2]],
+            [lo[0], hi[1], hi[2]],
+            [hi[0], hi[1], hi[2]],
+        ],
+        dtype=np.float64,
+    )
+
+
+def transform_aabb_colmap_to_nerfstudio(bbox: np.ndarray, transform_4x4: np.ndarray) -> np.ndarray:
+    """Transform axis-aligned bbox (2,3) min/max from COLMAP world to Nerfstudio world."""
+    corners_t = transform_points_colmap_to_nerfstudio(aabb_corners(bbox), transform_4x4)
+    return np.stack([corners_t.min(axis=0), corners_t.max(axis=0)], axis=0)
+
+
+def dataparser_transform_to_4x4(dataparser_transform) -> np.ndarray:
+    """Nerfstudio ``dataparser_transform`` (3×4 or 4×4) as a 4×4 matrix."""
+    t = np.asarray(dataparser_transform, dtype=np.float64)
+    if t.shape == (3, 4):
+        out = np.eye(4, dtype=np.float64)
+        out[:3, :4] = t
+        return out
+    if t.shape == (4, 4):
+        return t
+    raise ValueError(f"dataparser_transform has unexpected shape {t.shape}")
+
+
+def transform_points_to_dataparser(
+    xyz: np.ndarray,
+    dataparser_transform,
+    dataparser_scale: float,
+) -> np.ndarray:
+    """Match NerfstudioDataparser point loading: homogeneous @ T.T, then × scale."""
+    pts = np.asarray(xyz, dtype=np.float64)
+    t4 = dataparser_transform_to_4x4(dataparser_transform)
+    homog = np.concatenate([pts, np.ones((pts.shape[0], 1), dtype=np.float64)], axis=1)
+    return (homog @ t4.T)[:, :3] * float(dataparser_scale)
+
+
+def transform_aabb_to_dataparser(
+    bbox: np.ndarray,
+    dataparser_transform,
+    dataparser_scale: float,
+) -> np.ndarray:
+    """Transform AABB into the same coordinates as the trained splat / ``ns-viewer`` scene."""
+    corners_t = transform_points_to_dataparser(aabb_corners(bbox), dataparser_transform, dataparser_scale)
+    return np.stack([corners_t.min(axis=0), corners_t.max(axis=0)], axis=0)
+
+
+def orient_transform_for_saved_coords(
+    dataparser_transform,
+    ns_data_dir: Path,
+) -> np.ndarray:
+    """
+    Map ``transforms.json`` / ``sparse_pc.ply`` coordinates → splat viewer coordinates.
+
+    ``dataparser_transform`` is ``T_orient @ T_applied`` (COLMAP → viewer). Points and boxes
+    from ``sparse_pc.ply`` are already in saved space (after ``T_applied`` only), so we must
+    not apply ``T_applied`` again.
+    """
+    t_full = dataparser_transform_to_4x4(dataparser_transform)
+    t_applied = load_applied_transform(ns_data_dir)
+    if t_applied is None:
+        return t_full
+    return t_full @ np.linalg.inv(t_applied)

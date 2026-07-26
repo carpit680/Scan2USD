@@ -56,6 +56,31 @@ def world_to_camera_matrix(qvec: np.ndarray, tvec: np.ndarray) -> tuple[np.ndarr
     return r, tvec
 
 
+def project_points_c2w(
+    xyz_w: np.ndarray,
+    c2w: np.ndarray,
+    intr: CameraIntrinsics,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Project world points with a Nerfstudio ``transform_matrix`` (camera-to-world)."""
+    r_cw = np.asarray(c2w[:3, :3], dtype=np.float64)
+    t_cw = np.asarray(c2w[:3, 3], dtype=np.float64)
+    r_wc = r_cw.T
+    t_wc = -r_wc @ t_cw
+    xc = (r_wc @ np.asarray(xyz_w, dtype=np.float64).T).T + t_wc
+    z = xc[:, 2]
+    model = intr.model.upper()
+    if model == "SIMPLE_PINHOLE":
+        f, cx, cy = intr.params[0], intr.params[1], intr.params[2]
+        fx = fy = f
+    elif model in ("PINHOLE", "OPENCV"):
+        fx, fy, cx, cy = intr.params[:4]
+    else:
+        raise ValueError(f"Unsupported camera model: {intr.model}")
+    u = fx * (xc[:, 0] / (z + 1e-12)) + cx
+    v = fy * (xc[:, 1] / (z + 1e-12)) + cy
+    return np.stack([u, v], axis=1), z
+
+
 def project_points(
     xyz_w: np.ndarray,
     qvec: np.ndarray,
@@ -164,6 +189,58 @@ def read_colmap_model(txt_dir: Path) -> tuple[dict[int, CameraIntrinsics], dict[
     return cams, images, pids, xyz
 
 
+def points_in_frustum(
+    uv: np.ndarray,
+    depth: np.ndarray,
+    xyz_w: np.ndarray,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    *,
+    min_points: int = 8,
+    min_depth: float = 0.05,
+    depth_trim_mad: float = 3.0,
+    inner_margin_frac: float = 0.0,
+    depth_percentile: tuple[float, float] | None = (10.0, 90.0),
+) -> np.ndarray | None:
+    """World points projecting inside a 2D rect, with depth trimming."""
+    if inner_margin_frac > 0:
+        bw, bh = x1 - x0, y1 - y0
+        mx, my = inner_margin_frac * bw, inner_margin_frac * bh
+        x0, y0, x1, y1 = x0 + mx, y0 + my, x1 - mx, y1 - my
+        if x1 <= x0 or y1 <= y0:
+            return None
+    mask = (
+        np.isfinite(uv[:, 0])
+        & np.isfinite(uv[:, 1])
+        & (depth > min_depth)
+        & (uv[:, 0] >= x0)
+        & (uv[:, 0] <= x1)
+        & (uv[:, 1] >= y0)
+        & (uv[:, 1] <= y1)
+    )
+    pts = xyz_w[mask]
+    depths = depth[mask]
+    if pts.shape[0] < min_points:
+        return None
+    if depth_percentile is not None:
+        lo, hi = np.percentile(depths, depth_percentile)
+        keep = (depths >= lo) & (depths <= hi)
+        pts = pts[keep]
+        depths = depths[keep]
+        if pts.shape[0] < min_points:
+            return None
+    med = float(np.median(depths))
+    mad = float(np.median(np.abs(depths - med))) + 1e-6
+    depth_gate = max(depth_trim_mad * mad, 0.08 * med)
+    keep = np.abs(depths - med) <= depth_gate
+    pts = pts[keep]
+    if pts.shape[0] < min_points:
+        return None
+    return pts
+
+
 def bbox3d_from_points_in_frustum(
     uv: np.ndarray,
     depth: np.ndarray,
@@ -175,20 +252,28 @@ def bbox3d_from_points_in_frustum(
     *,
     min_points: int = 8,
     min_depth: float = 0.05,
+    depth_trim_mad: float = 3.0,
+    percentile: tuple[float, float] = (5.0, 95.0),
+    max_extent_m: float | None = None,
 ) -> np.ndarray | None:
-    """Axis-aligned 3D bbox from world points projecting inside 2D rect."""
-    mask = (
-        np.isfinite(uv[:, 0])
-        & np.isfinite(uv[:, 1])
-        & (depth > min_depth)
-        & (uv[:, 0] >= x0)
-        & (uv[:, 0] <= x1)
-        & (uv[:, 1] >= y0)
-        & (uv[:, 1] <= y1)
+    """
+    Axis-aligned 3D bbox from world points projecting inside a 2D rect.
+
+    Sparse COLMAP points inside a YOLO box often include distant background along the
+    viewing ray; we trim by depth and use percentiles for a tighter AABB.
+    """
+    pts = points_in_frustum(
+        uv, depth, xyz_w, x0, y0, x1, y1,
+        min_points=min_points, min_depth=min_depth, depth_trim_mad=depth_trim_mad,
     )
-    pts = xyz_w[mask]
-    if pts.shape[0] < min_points:
+    if pts is None:
         return None
-    lo = pts.min(axis=0)
-    hi = pts.max(axis=0)
+
+    lo = np.percentile(pts, percentile[0], axis=0)
+    hi = np.percentile(pts, percentile[1], axis=0)
+    if max_extent_m is not None:
+        center = (lo + hi) / 2.0
+        half = np.minimum((hi - lo) / 2.0, max_extent_m / 2.0)
+        lo = center - half
+        hi = center + half
     return np.stack([lo, hi], axis=0)

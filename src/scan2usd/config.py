@@ -24,6 +24,18 @@ _PATH_VALUE_KEYS: frozenset[str] = frozenset(
     }
 )
 
+# Standard layout under ``workspace_dir``. Omit these keys from YAML to inherit.
+# Nested keys use dotted paths into the raw/config dict.
+WORKSPACE_PATH_LAYOUT: dict[str, str] = {
+    "frames_dir": "frames",
+    "colmap_txt_dir": "colmap_txt",
+    "nerfstudio_data_dir": "ns_data",
+    "renders_dir": "renders",
+    "dataset_dir": "dataset",
+    "segmentation.masks_dir": "masks",
+    "usd.output_dir": "usd",
+}
+
 
 def _coerce_path_field(val: Any, base: Path) -> Any:
     if val is None:
@@ -63,6 +75,358 @@ def _paths_base(config_path: Path, raw: dict[str, Any]) -> Path:
     if isinstance(mode, str) and mode not in ("", "cwd"):
         return Path(mode).expanduser().resolve()
     return Path.cwd().resolve()
+
+
+def _nested_path(value: Any, base: Path) -> Path | None:
+    if value in (None, ""):
+        return None
+    resolved = _coerce_path_field(value, base)
+    return Path(resolved) if resolved is not None else None
+
+
+def _raw_get(data: dict[str, Any], dotted: str) -> Any:
+    cur: Any = data
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
+def _raw_has(data: dict[str, Any], dotted: str) -> bool:
+    cur: Any = data
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return False
+        cur = cur[part]
+    return True
+
+
+def _raw_del(data: dict[str, Any], dotted: str) -> None:
+    parts = dotted.split(".")
+    cur: Any = data
+    stack: list[tuple[dict[str, Any], str]] = []
+    for part in parts[:-1]:
+        if not isinstance(cur, dict) or part not in cur:
+            return
+        stack.append((cur, part))
+        cur = cur[part]
+    if not isinstance(cur, dict) or parts[-1] not in cur:
+        return
+    del cur[parts[-1]]
+    # Drop empty nested dicts left behind (e.g. empty segmentation: {})
+    for parent, key in reversed(stack):
+        child = parent.get(key)
+        if isinstance(child, dict) and not child:
+            del parent[key]
+        else:
+            break
+
+
+def workspace_layout_paths(workspace_dir: Path | str) -> dict[str, str]:
+    """Map dotted config keys → path strings under ``workspace_dir``."""
+    root = Path(workspace_dir)
+    return {key: str(root / leaf) for key, leaf in WORKSPACE_PATH_LAYOUT.items()}
+
+
+def strip_workspace_derived_paths(raw: dict[str, Any]) -> dict[str, Any]:
+    """
+    Remove standard layout path keys so they re-derive from ``workspace_dir`` on load.
+
+    Use when the workspace folder changes, or when saving the form UI so YAML only
+    needs ``workspace_dir`` set once. Explicit overrides can still be added in raw YAML.
+    """
+    out = dict(raw)
+    for key in WORKSPACE_PATH_LAYOUT:
+        _raw_del(out, key)
+    return out
+
+
+def sync_workspace_paths(
+    raw: dict[str, Any],
+    *,
+    previous_workspace_dir: str | None = None,
+) -> dict[str, Any]:
+    """
+    Keep workspace-relative paths coherent with ``workspace_dir``.
+
+    - If ``workspace_dir`` changed vs ``previous_workspace_dir``, drop derived keys.
+    - Drop derived keys whose values already match the default under the current workspace
+      (redundant with inheritance).
+    - Leave true overrides (non-default paths) intact.
+    """
+    out = dict(raw)
+    ws = out.get("workspace_dir")
+    if ws in (None, ""):
+        ws = "workspace"
+        out["workspace_dir"] = ws
+    ws_str = str(ws)
+    if previous_workspace_dir is not None and str(previous_workspace_dir) != ws_str:
+        return strip_workspace_derived_paths(out)
+
+    defaults = workspace_layout_paths(ws_str)
+    for key, expected in defaults.items():
+        if not _raw_has(out, key):
+            continue
+        current = _raw_get(out, key)
+        if current in (None, ""):
+            _raw_del(out, key)
+            continue
+        cur_s = str(current).rstrip("/\\")
+        exp_s = str(expected).rstrip("/\\")
+        if cur_s == exp_s:
+            _raw_del(out, key)
+            continue
+        try:
+            if Path(cur_s).expanduser().resolve() == Path(exp_s).expanduser().resolve():
+                _raw_del(out, key)
+        except OSError:
+            pass
+    return out
+
+
+def _path_unset(data: dict[str, Any], key: str) -> bool:
+    if key not in data:
+        return True
+    val = data[key]
+    return val is None or val == ""
+
+
+@dataclass
+class CaptureConfig:
+    """Input contract for a room/workcell capture."""
+
+    modality: str = "rgb"
+    depth_dir: Path | None = None
+    lidar_path: Path | None = None
+    calibration_path: Path | None = None
+    clean_plate_dir: Path | None = None
+    object_capture_dirs: dict[str, Path] = field(default_factory=dict)
+    scale_anchor_m: float | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None, base: Path) -> CaptureConfig:
+        raw = data or {}
+        object_dirs = {
+            str(name): Path(_coerce_path_field(value, base))
+            for name, value in dict(raw.get("object_capture_dirs") or {}).items()
+        }
+        return cls(
+            modality=str(raw.get("modality", "rgb")).lower(),
+            depth_dir=_nested_path(raw.get("depth_dir"), base),
+            lidar_path=_nested_path(raw.get("lidar_path"), base),
+            calibration_path=_nested_path(raw.get("calibration_path"), base),
+            clean_plate_dir=_nested_path(raw.get("clean_plate_dir"), base),
+            object_capture_dirs=object_dirs,
+            scale_anchor_m=(
+                None if raw.get("scale_anchor_m") is None else float(raw["scale_anchor_m"])
+            ),
+        )
+
+
+@dataclass
+class SplatCleanupConfig:
+    """Post-export ParticleField stray-Gaussian cleanup."""
+
+    enabled: bool = True
+    outlier_std: float = 4.0
+    min_opacity: float = 0.01
+    max_scale: float | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> SplatCleanupConfig:
+        raw = data or {}
+        max_scale = raw.get("max_scale", None)
+        return cls(
+            enabled=bool(raw.get("enabled", True)),
+            outlier_std=float(raw.get("outlier_std", 4.0)),
+            min_opacity=float(raw.get("min_opacity", 0.01)),
+            max_scale=None if max_scale is None else float(max_scale),
+        )
+
+    def to_params(self):
+        from scan2usd.reconstruction.splat_cleanup import SplatCleanupParams
+
+        return SplatCleanupParams(
+            enabled=self.enabled,
+            outlier_std=self.outlier_std,
+            min_opacity=self.min_opacity,
+            max_scale=self.max_scale,
+        )
+
+
+@dataclass
+class ReconstructionConfig:
+    """Visual and geometric reconstruction backend selection."""
+
+    visual_backend: str = "3dgrut"
+    rgbd_geometry_backend: str = "nvblox"
+    rgb_geometry_backend: str = "openmvs"
+    grut_config: str = "apps/colmap_3dgut.yaml"
+    grut_max_iterations: int = 30000
+    held_out_ratio: float = 0.1
+    preview_allow_unobserved_background: bool = True
+    splat_cleanup: SplatCleanupConfig = field(default_factory=SplatCleanupConfig)
+    # Extra Hydra ``key=value`` overrides appended to 3DGRUT train.py (quality knobs).
+    grut_overrides: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> ReconstructionConfig:
+        raw = data or {}
+        overrides_raw = raw.get("grut_overrides") or []
+        if isinstance(overrides_raw, str):
+            overrides = [overrides_raw]
+        else:
+            overrides = [str(item) for item in overrides_raw]
+        return cls(
+            visual_backend=str(raw.get("visual_backend", "3dgrut")).lower(),
+            rgbd_geometry_backend=str(raw.get("rgbd_geometry_backend", "nvblox")).lower(),
+            rgb_geometry_backend=str(raw.get("rgb_geometry_backend", "openmvs")).lower(),
+            grut_config=str(raw.get("grut_config", "apps/colmap_3dgut.yaml")),
+            grut_max_iterations=int(raw.get("grut_max_iterations", 30000)),
+            held_out_ratio=float(raw.get("held_out_ratio", 0.1)),
+            preview_allow_unobserved_background=bool(
+                raw.get("preview_allow_unobserved_background", True)
+            ),
+            splat_cleanup=SplatCleanupConfig.from_dict(raw.get("splat_cleanup")),
+            grut_overrides=overrides,
+        )
+
+
+@dataclass
+class SegmentationConfig:
+    proposal_model: str = "grounding-dino"
+    mask_model: str = "sam2"
+    masks_dir: Path | None = None
+    min_views_per_object: int = 3
+    review_required: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None, base: Path) -> SegmentationConfig:
+        raw = data or {}
+        return cls(
+            proposal_model=str(raw.get("proposal_model", "grounding-dino")),
+            mask_model=str(raw.get("mask_model", "sam2")),
+            masks_dir=_nested_path(raw.get("masks_dir"), base),
+            min_views_per_object=int(raw.get("min_views_per_object", 3)),
+            review_required=bool(raw.get("review_required", True)),
+        )
+
+
+@dataclass
+class GeometryConfig:
+    voxel_size_m: float = 0.02
+    target_static_triangles: int = 500_000
+    target_object_triangles: int = 100_000
+    simplify_ratio: float = 0.35
+    rgb_only_requires_scale: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> GeometryConfig:
+        raw = data or {}
+        return cls(
+            voxel_size_m=float(raw.get("voxel_size_m", 0.02)),
+            target_static_triangles=int(raw.get("target_static_triangles", 500_000)),
+            target_object_triangles=int(raw.get("target_object_triangles", 100_000)),
+            simplify_ratio=float(raw.get("simplify_ratio", 0.35)),
+            rgb_only_requires_scale=bool(raw.get("rgb_only_requires_scale", True)),
+        )
+
+
+@dataclass
+class MaterialConfig:
+    texture_resolution: int = 4096
+    author_baked_variant: bool = True
+    author_pbr_variant: bool = True
+    estimate_lighting: bool = True
+    hdr_path: Path | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None, base: Path) -> MaterialConfig:
+        raw = data or {}
+        return cls(
+            texture_resolution=int(raw.get("texture_resolution", 4096)),
+            author_baked_variant=bool(raw.get("author_baked_variant", True)),
+            author_pbr_variant=bool(raw.get("author_pbr_variant", True)),
+            estimate_lighting=bool(raw.get("estimate_lighting", True)),
+            hdr_path=_nested_path(raw.get("hdr_path"), base),
+        )
+
+
+@dataclass
+class PhysicsConfig:
+    default_density_kg_m3: float = 700.0
+    default_friction: float = 0.5
+    default_restitution: float = 0.05
+    dynamic_collider: str = "convexDecomposition"
+    vhacd_max_hulls: int = 32
+    vhacd_resolution: int = 100_000
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> PhysicsConfig:
+        raw = data or {}
+        return cls(
+            default_density_kg_m3=float(raw.get("default_density_kg_m3", 700.0)),
+            default_friction=float(raw.get("default_friction", 0.5)),
+            default_restitution=float(raw.get("default_restitution", 0.05)),
+            dynamic_collider=str(raw.get("dynamic_collider", "convexDecomposition")),
+            vhacd_max_hulls=int(raw.get("vhacd_max_hulls", 32)),
+            vhacd_resolution=int(raw.get("vhacd_resolution", 100_000)),
+        )
+
+
+@dataclass
+class UsdConfig:
+    output_dir: Path | None = None
+    root_filename: str = "scene.usd"
+    isaac_version: str = "6.0"
+    meters_per_unit: float = 1.0
+    up_axis: str = "Z"
+    default_look: str = "pbr"
+    render_mode: str = "hybrid"
+    binary_mesh_layers: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None, base: Path) -> UsdConfig:
+        raw = data or {}
+        return cls(
+            output_dir=_nested_path(raw.get("output_dir"), base),
+            root_filename=str(raw.get("root_filename", "scene.usd")),
+            isaac_version=str(raw.get("isaac_version", "6.0")),
+            meters_per_unit=float(raw.get("meters_per_unit", 1.0)),
+            up_axis=str(raw.get("up_axis", "Z")).upper(),
+            default_look=str(raw.get("default_look", "pbr")).lower(),
+            render_mode=str(raw.get("render_mode", "hybrid")).lower(),
+            binary_mesh_layers=bool(raw.get("binary_mesh_layers", True)),
+        )
+
+
+@dataclass
+class QAConfig:
+    required: bool = True
+    min_background_coverage: float = 0.9
+    allow_background_holes: bool = False
+    max_registration_error_m: float = 0.03
+    max_depth_error_m: float = 0.05
+    min_texture_coverage: float = 0.9
+    max_dynamic_collider_faces: int = 20_000
+    require_held_out_renders: bool = True
+    require_isaac_validation: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> QAConfig:
+        raw = data or {}
+        return cls(
+            required=bool(raw.get("required", True)),
+            min_background_coverage=float(raw.get("min_background_coverage", 0.9)),
+            allow_background_holes=bool(raw.get("allow_background_holes", False)),
+            max_registration_error_m=float(raw.get("max_registration_error_m", 0.03)),
+            max_depth_error_m=float(raw.get("max_depth_error_m", 0.05)),
+            min_texture_coverage=float(raw.get("min_texture_coverage", 0.9)),
+            max_dynamic_collider_faces=int(raw.get("max_dynamic_collider_faces", 20_000)),
+            require_held_out_renders=bool(raw.get("require_held_out_renders", True)),
+            require_isaac_validation=bool(raw.get("require_isaac_validation", True)),
+        )
 
 
 @dataclass
@@ -122,10 +486,30 @@ class SceneConfig:
             "ns_process_data": "ns-process-data",
             "ns_train": "ns-train",
             "ns_render": "ns-render",
+            "grut_python": "python",
+            "grut_root": "",
+            "nvblox": "nvblox",
+            "openmvs_interface": "InterfaceCOLMAP",
+            "openmvs_densify": "DensifyPointCloud",
+            "openmvs_reconstruct": "ReconstructMesh",
+            "openmvs_refine": "RefineMesh",
+            "openmvs_texture": "TextureMesh",
+            "segmentation_python": "python",
+            "sam2_runner": "",
+            "object_reconstruction_runner": "",
+            "isaac_python": "python.sh",
         }
     )
     process_data: ProcessDataConfig = field(default_factory=ProcessDataConfig)
     splatfacto: SplatfactoConfig = field(default_factory=SplatfactoConfig)
+    capture: CaptureConfig = field(default_factory=CaptureConfig)
+    reconstruction: ReconstructionConfig = field(default_factory=ReconstructionConfig)
+    segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
+    geometry: GeometryConfig = field(default_factory=GeometryConfig)
+    materials: MaterialConfig = field(default_factory=MaterialConfig)
+    physics: PhysicsConfig = field(default_factory=PhysicsConfig)
+    usd: UsdConfig = field(default_factory=UsdConfig)
+    qa: QAConfig = field(default_factory=QAConfig)
 
     @classmethod
     def load(cls, path: Path) -> SceneConfig:
@@ -136,24 +520,39 @@ class SceneConfig:
         data.pop("paths_relative_to", None)  # consumed by _paths_base, not a SceneConfig field
         base = _paths_base(path, raw)
         data = _apply_path_fields(data, base)
-        return cls._from_dict(data)
+        return cls._from_dict(data, base=base)
 
     @classmethod
-    def _from_dict(cls, data: dict[str, Any]) -> SceneConfig:
+    def _from_dict(cls, data: dict[str, Any], *, base: Path | None = None) -> SceneConfig:
+        base = (base or Path.cwd()).resolve()
+
         def p(key: str, default: Any) -> Any:
             return data[key] if key in data else default
 
-        return cls(
+        workspace_dir = Path(p("workspace_dir", Path("workspace")))
+        if not workspace_dir.is_absolute():
+            workspace_dir = (base / workspace_dir).resolve()
+
+        def layout_path(key: str, leaf: str) -> Path:
+            if _path_unset(data, key):
+                return workspace_dir / leaf
+            return Path(data[key])
+
+        cfg = cls(
             name=str(p("name", "default_scene")),
             classes=list(p("classes", SceneConfig().classes)),
             video_path=p("video_path", None),
-            frames_dir=Path(p("frames_dir", Path("workspace/frames"))),
-            workspace_dir=Path(p("workspace_dir", Path("workspace"))),
-            colmap_txt_dir=Path(p("colmap_txt_dir", Path("workspace/colmap_txt"))),
-            nerfstudio_data_dir=Path(p("nerfstudio_data_dir", Path("workspace/ns_data"))),
+            frames_dir=layout_path("frames_dir", WORKSPACE_PATH_LAYOUT["frames_dir"]),
+            workspace_dir=workspace_dir,
+            colmap_txt_dir=layout_path(
+                "colmap_txt_dir", WORKSPACE_PATH_LAYOUT["colmap_txt_dir"]
+            ),
+            nerfstudio_data_dir=layout_path(
+                "nerfstudio_data_dir", WORKSPACE_PATH_LAYOUT["nerfstudio_data_dir"]
+            ),
             splat_config_path=p("splat_config_path", None),
-            renders_dir=Path(p("renders_dir", Path("workspace/renders"))),
-            dataset_dir=Path(p("dataset_dir", Path("workspace/dataset"))),
+            renders_dir=layout_path("renders_dir", WORKSPACE_PATH_LAYOUT["renders_dir"]),
+            dataset_dir=layout_path("dataset_dir", WORKSPACE_PATH_LAYOUT["dataset_dir"]),
             yolo_model=str(p("yolo_model", "yolov8n.pt")),
             train_epochs=int(p("train_epochs", 50)),
             train_imgsz=int(p("train_imgsz", 640)),
@@ -162,7 +561,53 @@ class SceneConfig:
             split=dict(p("split", {})),
             pose_sampling=dict(p("pose_sampling", {})),
             lift=dict(p("lift", {})),
-            external=dict(p("external", SceneConfig().external)),
+            external={**SceneConfig().external, **dict(p("external", {}))},
             process_data=ProcessDataConfig.from_dict(p("process_data", None)),
             splatfacto=SplatfactoConfig.from_dict(p("splatfacto", None)),
+            capture=CaptureConfig.from_dict(p("capture", None), base),
+            reconstruction=ReconstructionConfig.from_dict(p("reconstruction", None)),
+            segmentation=SegmentationConfig.from_dict(p("segmentation", None), base),
+            geometry=GeometryConfig.from_dict(p("geometry", None)),
+            materials=MaterialConfig.from_dict(p("materials", None), base),
+            physics=PhysicsConfig.from_dict(p("physics", None)),
+            usd=UsdConfig.from_dict(p("usd", None), base),
+            qa=QAConfig.from_dict(p("qa", None)),
         )
+        if cfg.usd.output_dir is None:
+            cfg.usd.output_dir = (
+                workspace_dir / WORKSPACE_PATH_LAYOUT["usd.output_dir"]
+            )
+        if cfg.segmentation.masks_dir is None:
+            cfg.segmentation.masks_dir = (
+                workspace_dir / WORKSPACE_PATH_LAYOUT["segmentation.masks_dir"]
+            )
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        """Fail early on contracts that would produce ambiguous or invalid assets."""
+        if self.capture.modality not in {"rgb", "rgbd", "lidar"}:
+            raise ValueError("capture.modality must be rgb, rgbd, or lidar")
+        if not 0.0 <= self.reconstruction.held_out_ratio < 1.0:
+            raise ValueError("reconstruction.held_out_ratio must be in [0, 1)")
+        if self.segmentation.min_views_per_object < 1:
+            raise ValueError("segmentation.min_views_per_object must be >= 1")
+        if self.geometry.voxel_size_m <= 0:
+            raise ValueError("geometry.voxel_size_m must be positive")
+        if not 0.0 < self.geometry.simplify_ratio <= 1.0:
+            raise ValueError("geometry.simplify_ratio must be in (0, 1]")
+        if self.physics.default_density_kg_m3 <= 0:
+            raise ValueError("physics.default_density_kg_m3 must be positive")
+        if self.usd.up_axis not in {"Y", "Z"}:
+            raise ValueError("usd.up_axis must be Y or Z")
+        if self.usd.meters_per_unit <= 0:
+            raise ValueError("usd.meters_per_unit must be positive")
+        if self.usd.default_look not in {"baked", "pbr"}:
+            raise ValueError("usd.default_look must be baked or pbr")
+        for key in (
+            "min_background_coverage",
+            "min_texture_coverage",
+        ):
+            value = float(getattr(self.qa, key))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"qa.{key} must be in [0, 1]")

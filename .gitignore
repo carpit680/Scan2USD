@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 workspace/
+workspace_*/
 *.pt
 *.npz
 runs/
@@ -14,3 +15,7 @@ runs/
 # Local planning / research notes (not part of the shipped package)
 goal.md
 resources.md
+
+# GUI frontend
+gui/frontend/node_modules/
+gui/frontend/dist/

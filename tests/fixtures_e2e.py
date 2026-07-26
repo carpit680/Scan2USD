@@ -107,6 +107,23 @@ def build_e2e_workspace(root: Path) -> Path:
         )
         pid += 1
     (colmap_txt / "points3D.txt").write_text("\n".join(pts) + "\n", encoding="utf-8")
+    xyz_rows = [" ".join(line.split()[1:4]) for line in pts[1:]]
+    (ns_data / "sparse_pc.ply").write_text(
+        "\n".join(
+            [
+                "ply",
+                "format ascii 1.0",
+                f"element vertex {len(xyz_rows)}",
+                "property float x",
+                "property float y",
+                "property float z",
+                "end_header",
+                *xyz_rows,
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
 
     eye = np.eye(4).tolist()
     frames_meta = []

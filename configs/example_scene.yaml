@@ -1,11 +1,6 @@
-name: vape
-video_path: /home/arpit/Desktop/scan2.MOV
-workspace_dir: workspace
-frames_dir: workspace/frames
-colmap_txt_dir: workspace/colmap_txt
-nerfstudio_data_dir: workspace/ns_data
-splat_config_path: workspace/ns_outputs/splatfacto/splatfacto/2026-05-17_203820/config.yml
-# Splatfacto training (ns-train). Re-run: scan2usd reconstruct … --skip-process-data
+name: desk
+video_path: /home/arpit/Scan2USD/workspace_desk/uploads/IMG_0056.mov
+workspace_dir: workspace_desk
 process_data:
   num_downscales: 2
 splatfacto:
@@ -16,18 +11,20 @@ splatfacto:
   rasterize_mode: antialiased
   cull_alpha_thresh: 0.005
   ssim_lambda: 0.15
-  # camera_res_scale_factor: 0.5   # uncomment if GPU OOM during training
-  camera_optimizer_mode: "off"
-renders_dir: workspace/renders
-dataset_dir: workspace/dataset
+  camera_optimizer_mode: 'off'
 classes:
-  - chair
-  - table
-  - door
-  - couch
-  - cabinet
-  - obstacle
-  - box
+- cell phone
+- remote
+- laptop
+- monitor
+- speaker
+- keyboard
+- light
+- led
+- tablet
+- mouse
+- robot
+- robotic arm
 yolo_model: yolov8n.pt
 train_epochs: 3
 train_imgsz: 640
@@ -41,13 +38,100 @@ pose_sampling:
   num_poses: 64
   position_jitter_m: 0.05
   height_jitter_m: 0.02
-  max_rotation_deg: 8.0
+  max_rotation_deg: 8
   interpolation_keyframes: 8
 lift:
   min_points_in_box: 8
   merge_center_dist_m: 0.35
+  depth_trim_mad: 2
+  inner_margin_frac: 0.12
+  depth_percentile:
+  - 10
+  - 90
+  percentile:
+  - 5
+  - 95
+capture:
+  modality: rgb
+  depth_dir: null
+  lidar_path: null
+  calibration_path: null
+  clean_plate_dir: null
+  object_capture_dirs: {}
+  scale_anchor_m: null
+reconstruction:
+  visual_backend: 3dgrut
+  rgbd_geometry_backend: nvblox
+  rgb_geometry_backend: openmvs
+  grut_config: apps/colmap_3dgut.yaml
+  grut_max_iterations: 50000
+  held_out_ratio: 0.05
+  preview_allow_unobserved_background: false
+  grut_overrides:
+  - scheduler.positions.max_steps=50000
+  - loss.lambda_ssim=0.25
+  - strategy.densify.end_iteration=10000
+  splat_cleanup:
+    enabled: true
+    outlier_std: 2
+    min_opacity: 0.05
+    max_scale: null
+segmentation:
+  proposal_model: yolov8s-worldv2.pt
+  mask_model: sam2
+  min_views_per_object: 3
+  review_required: true
+geometry:
+  voxel_size_m: 0.02
+  target_static_triangles: 500000
+  target_object_triangles: 100000
+  simplify_ratio: 0.35
+  rgb_only_requires_scale: true
+materials:
+  texture_resolution: 4096
+  author_baked_variant: true
+  author_pbr_variant: true
+  estimate_lighting: true
+  hdr_path: null
+physics:
+  default_density_kg_m3: 700
+  default_friction: 0.5
+  default_restitution: 0.05
+  dynamic_collider: convexDecomposition
+  vhacd_max_hulls: 32
+  vhacd_resolution: 100000
+usd:
+  root_filename: desk.usd
+  isaac_version: '6.0'
+  meters_per_unit: 1
+  up_axis: Z
+  default_look: pbr
+  render_mode: hybrid
+  binary_mesh_layers: false
+qa:
+  required: true
+  min_background_coverage: 0.9
+  allow_background_holes: true
+  max_registration_error_m: 0.03
+  max_depth_error_m: 0.05
+  min_texture_coverage: 0.9
+  max_dynamic_collider_faces: 20000
+  require_held_out_renders: true
+  require_isaac_validation: true
 external:
   colmap: colmap
   ns_process_data: ns-process-data
   ns_train: ns-train
   ns_render: ns-render
+  grut_python: /home/arpit/Scan2USD/workspace/external/3dgrut/.venv/bin/python
+  grut_root: /home/arpit/Scan2USD/workspace/external/3dgrut
+  nvblox: nvblox
+  openmvs_interface: /home/arpit/Scan2USD/workspace/bin/InterfaceCOLMAP
+  openmvs_densify: /home/arpit/Scan2USD/workspace/bin/DensifyPointCloud
+  openmvs_reconstruct: /home/arpit/Scan2USD/workspace/bin/ReconstructMesh
+  openmvs_refine: /home/arpit/Scan2USD/workspace/bin/RefineMesh
+  openmvs_texture: TextureMesh
+  sam2_runner: /home/arpit/Scan2USD/.venv/bin/python /home/arpit/Scan2USD/tools/segmentation/sam2_runner.py
+    --max-objects 15 --batch-size 2
+  object_reconstruction_runner: /home/arpit/Scan2USD/.venv/bin/python /home/arpit/Scan2USD/tools/geometry/masked_object_recon.py
+  isaac_python: /home/arpit/Scan2USD/workspace/isaac_env/bin/python

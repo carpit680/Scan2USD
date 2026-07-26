@@ -151,6 +151,56 @@ def _nvidia_smi_item() -> ItemResult:
     )
 
 
+def _external_config_item(
+    cfg: SceneConfig,
+    key: str,
+    *,
+    label: str,
+    required: bool = True,
+) -> ItemResult:
+    value = str((cfg.external or {}).get(key, "")).strip()
+    if not value:
+        return ItemResult(label, False, f"external.{key} is not configured", (), required)
+    first = value.split()[0]
+    path = Path(first).expanduser()
+    resolved = str(path.resolve()) if path.is_file() else shutil.which(first)
+    if resolved:
+        return ItemResult(label, True, resolved, (), required)
+    return ItemResult(label, False, f"not found: {value}", (), required)
+
+
+def _hybrid_usd_tools(cfg: SceneConfig) -> list[ItemResult]:
+    grut_root = Path(str((cfg.external or {}).get("grut_root", ""))).expanduser()
+    grut = ItemResult(
+        "3DGRUT v1.1+",
+        (grut_root / "train.py").is_file(),
+        str(grut_root.resolve()) if (grut_root / "train.py").is_file() else "external.grut_root missing",
+        (),
+        True,
+    )
+    items = [
+        grut,
+        _external_config_item(cfg, "sam2_runner", label="SAM2 runner"),
+        _external_config_item(
+            cfg,
+            "object_reconstruction_runner",
+            label="object reconstruction runner",
+        ),
+        _external_config_item(cfg, "isaac_python", label="Isaac Sim python.sh"),
+    ]
+    if cfg.capture.modality in {"rgbd", "lidar"}:
+        items.append(_external_config_item(cfg, "nvblox", label="nvblox mesh runner"))
+    else:
+        for key, label in (
+            ("openmvs_interface", "OpenMVS InterfaceCOLMAP"),
+            ("openmvs_densify", "OpenMVS DensifyPointCloud"),
+            ("openmvs_reconstruct", "OpenMVS ReconstructMesh"),
+            ("openmvs_refine", "OpenMVS RefineMesh"),
+        ):
+            items.append(_external_config_item(cfg, key, label=label))
+    return items
+
+
 GSPLAT_SPLATFACTO_LABEL = "gsplat CUDA (Splatfacto)"
 
 
@@ -343,16 +393,93 @@ def _reconstruct_ready(
     return all(x.ok for x in ns_items)
 
 
-def print_doctor_report(cfg: SceneConfig) -> None:
-    """Print full doctor output to stdout."""
-    echo = typer.echo
+@dataclass
+class DoctorReport:
+    """Structured doctor results for CLI and GUI consumers."""
 
+    groups: dict[str, list[ItemResult]]
+    apt_packages: tuple[str, ...]
+    apt_install_line: str | None
+    reconstruct_ready: bool
+
+
+def collect_doctor_results(cfg: SceneConfig) -> DoctorReport:
+    """Run all doctor checks and return structured results (no I/O)."""
     colmap = _colmap_item(cfg)
     ns_items = _nerfstudio_cli_items(cfg)
     ffmpeg = _check_binary("ffmpeg", apt=("ffmpeg",), label="ffmpeg")
     ffprobe = _check_binary("ffprobe", apt=("ffmpeg",), label="ffprobe")
     optional_bins = _optional_binaries()
     nvidia = _nvidia_smi_item()
+    hybrid_tools = _hybrid_usd_tools(cfg)
+    py_items: list[ItemResult] = [
+        _check_import("numpy", label="numpy", pip_hint='pip install "numpy>=1.24"'),
+        _check_opencv(),
+        _check_import(
+            "torch",
+            label="torch",
+            pip_hint="pip install torch (see https://pytorch.org/get-started/locally/)",
+        ),
+        _check_torch_cuda_splatfacto(),
+        _check_gsplat_splatfacto(),
+        _check_import("ultralytics", label="ultralytics", pip_hint="pip install ultralytics"),
+        _check_nerfstudio_import(),
+        _check_import(
+            "trimesh",
+            label="trimesh (USD geometry)",
+            pip_hint='pip install -e ".[geometry]"',
+        ),
+        _check_import(
+            "scipy",
+            label="scipy (registration QA)",
+            pip_hint='pip install -e ".[geometry]"',
+        ),
+        _check_import(
+            "gradio",
+            label="gradio (review UI)",
+            pip_hint='pip install -e ".[review]"',
+        ),
+    ]
+
+    groups: dict[str, list[ItemResult]] = {
+        "external": [colmap, *ns_items, ffmpeg, ffprobe],
+        "hybrid": list(hybrid_tools),
+        "optional": [*optional_bins, nvidia],
+        "python": list(py_items),
+    }
+
+    apt_pkgs: list[str] = []
+    for items in groups.values():
+        for it in items:
+            if not it.ok and it.apt_if_missing:
+                apt_pkgs.extend(it.apt_if_missing)
+    apt_unique = tuple(sorted(set(apt_pkgs)))
+    apt_line = _apt_install_line(apt_unique) if _linux() and apt_unique else None
+
+    return DoctorReport(
+        groups=groups,
+        apt_packages=apt_unique,
+        apt_install_line=apt_line,
+        reconstruct_ready=_reconstruct_ready(colmap, ns_items, ffmpeg, ffprobe)
+        and all(x.ok for x in py_items if x.required),
+    )
+
+
+def print_doctor_report(cfg: SceneConfig) -> None:
+    """Print full doctor output to stdout."""
+    echo = typer.echo
+    report = collect_doctor_results(cfg)
+
+    colmap = report.groups["external"][0]
+    # external: colmap, ns..., ffmpeg, ffprobe — ns items are between colmap and last two
+    external = report.groups["external"]
+    ns_items = external[1:-2]
+    ffmpeg = external[-2]
+    ffprobe = external[-1]
+    optional_bins = report.groups["optional"][:-1]
+    nvidia = report.groups["optional"][-1]
+    hybrid_tools = report.groups["hybrid"]
+    py_items = report.groups["python"]
 
     echo("External tools:")
     _print_item(echo, colmap)
@@ -368,6 +495,11 @@ def print_doctor_report(cfg: SceneConfig) -> None:
     _print_item(echo, ffprobe)
 
     echo("")
+    echo("Hybrid USD / Isaac production tools:")
+    for it in hybrid_tools:
+        _print_item(echo, it)
+
+    echo("")
     echo("Optional / tooling (recommended):")
     for it in optional_bins:
         _print_item(echo, it)
@@ -375,19 +507,6 @@ def print_doctor_report(cfg: SceneConfig) -> None:
 
     echo("")
     echo("Python environment:")
-    py_items: list[ItemResult] = [
-        _check_import("numpy", label="numpy", pip_hint='pip install "numpy>=1.24"'),
-        _check_opencv(),
-        _check_import(
-            "torch",
-            label="torch",
-            pip_hint="pip install torch (see https://pytorch.org/get-started/locally/)",
-        ),
-        _check_torch_cuda_splatfacto(),
-        _check_gsplat_splatfacto(),
-        _check_import("ultralytics", label="ultralytics", pip_hint="pip install ultralytics"),
-        _check_nerfstudio_import(),
-    ]
     for it in py_items:
         _print_item(echo, it)
 
@@ -395,17 +514,11 @@ def print_doctor_report(cfg: SceneConfig) -> None:
     echo("Next steps:")
     _emit_next_steps(echo, colmap, ns_items, ffmpeg, ffprobe, optional_bins, py_items)
 
-    apt_pkgs: list[str] = []
-    for it in [colmap, ffmpeg, ffprobe, *ns_items, *optional_bins, nvidia, *py_items]:
-        if not it.ok and it.apt_if_missing:
-            apt_pkgs.extend(it.apt_if_missing)
-
-    if _linux() and apt_pkgs:
+    if report.apt_install_line:
         echo("")
         echo("Suggested install (Debian / Ubuntu) for missing system packages:")
-        echo(f"  {_apt_install_line(tuple(apt_pkgs))}")
-
-    if not _linux() and apt_pkgs:
+        echo(f"  {report.apt_install_line}")
+    elif report.apt_packages and not _linux():
         echo("")
         echo("Some fixes need OS packages (apt hints omitted: not Linux).")
 

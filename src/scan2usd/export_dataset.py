@@ -7,7 +7,7 @@ import numpy as np
 
 from scan2usd.config import SceneConfig
 from scan2usd.dataset.layout import copy_image_label_pairs, ensure_yolo_tree, write_data_yaml
-from scan2usd.dataset.split import assign_train_val, records_from_frame_dir
+from scan2usd.dataset.split import assign_train_val, records_from_frame_dir, resolve_label_path
 from scan2usd.labeling.detect import write_yolo_label_file
 from scan2usd.labeling.lift import Object3D, intrinsics_from_transforms_meta, project_aabb_to_yolo_line_c2w
 
@@ -29,6 +29,14 @@ def _copy_image_label_dir(src_img_dir: Path, src_lbl_dir: Path, dst_img_dir: Pat
             dst_l.write_text("")
 
 
+def _image_dir_for_dataset(cfg: SceneConfig) -> Path:
+    """Prefer Nerfstudio images when present so stems match ``labels_real`` from ``label``."""
+    ns_images = cfg.nerfstudio_data_dir / "images"
+    if ns_images.is_dir() and any(ns_images.glob("*")):
+        return ns_images
+    return cfg.frames_dir
+
+
 def build_real_yolo_dataset(
     cfg: SceneConfig,
     *,
@@ -40,7 +48,8 @@ def build_real_yolo_dataset(
     """
     root = output_root or (cfg.workspace_dir / "dataset_real")
     labels_dir = labels_dir or (cfg.workspace_dir / "labels_real")
-    records = records_from_frame_dir(cfg.frames_dir)
+    images_dir = _image_dir_for_dataset(cfg)
+    records = records_from_frame_dir(images_dir)
     strat = str(cfg.split.get("strategy", "session"))
     val_sessions = list(cfg.split.get("val_sessions") or [])
     val_ratio = float(cfg.split.get("val_ratio", 0.2))
@@ -53,7 +62,7 @@ def build_real_yolo_dataset(
     )
 
     def pairs(recs):
-        return [(r.path, labels_dir / (r.label_key + ".txt")) for r in recs]
+        return [(r.path, resolve_label_path(labels_dir, r.path.name)) for r in recs]
 
     copy_image_label_pairs(pairs(train_r), pairs(val_r), root)
     write_data_yaml(root, cfg.classes)
