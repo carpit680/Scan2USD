@@ -28,6 +28,142 @@ Done (as of latest workspace)
 - ``configs/high_quality_scene.yaml``
 - Preview object ``bottle_001`` (masked out of env splat by design)
 
+Quality/tuning additions (2026-07-26)
+-------------------------------------
+- ``scan2usd render-heldout`` — headless Isaac renders at held-out COLMAP
+  cameras → PSNR/SSIM/LPIPS vs real frames → ``usd/scene_quality.json``.
+- ``scan2usd tune`` + GUI **Tuning** page — cheap splat-cleanup sweeps and
+  opt-in 3DGRUT retrain trials optimizing ``quality_score``; winner promoted
+  to ``<config>_tuned.yaml``. ``configs/golden_scene.yaml`` is the seed profile.
+- Correctness: baked meshes now carry ``transform_hash`` (auto re-bake when
+  floor/metric transform changes — the desk scan's 0.23 m registration error
+  came from a stale bake); floor RANSAC rejects planes below
+  ``geometry.min_floor_inlier_ratio`` (desk run had accepted 3.9% inliers);
+  ``segmentation.allow_no_objects`` enables environment-only builds.
+- Capture gate: ``reconstruct`` now reports the COLMAP registration rate and
+  fails below ``reconstruction.min_registration_rate``; frame extraction reports
+  how many frames it dropped as blurry (``reconstruction.blur_threshold``).
+
+KITCHEN scan is the working scene (2026-07-26)
+-----------------------------------------------
+``configs/kitchen_scene.yaml`` (50k) / ``configs/kitchen_preview.yaml`` (7k fast
+validation), workspace ``workspace_kitchen``, source ``~/Desktop/scan2.MOV``.
+
+- COLMAP: **787/787 frames registered (100%)**, 115,288 points, clean intrinsics
+  (fx 583.54 / fy 583.73, principal point centred). Frame extraction kept
+  787/851 (only 7.5% dropped as blurry).
+- Floor alignment passes: 1.6% of points below the plane, 100% of cameras above,
+  aligned Z 5th percentile 0.00.
+- Full hybrid chain runs end-to-end **environment-only** (no approved objects,
+  via ``segmentation.allow_no_objects``): 3DGRUT → cleanup (262,616 → 236,203
+  Gaussians) → OpenMVS static geometry → lighting → ``usd/kitchen.usd``.
+- **Measured quality** (Isaac RTX renders vs real frames, all 79 held-out views):
+
+  =========================  =============  =====  =====  =====  ==========
+  build                      quality_score   PSNR   SSIM  LPIPS  gaussians
+  =========================  =============  =====  =====  =====  ==========
+  7k iters, outlier_std 4          68.90    19.95  0.777  0.316    236,203
+  50k iters, outlier_std 4         66.74    18.03  0.756  0.323    414,776
+  50k iters, outlier_std 8         74.12    23.30  0.816  0.264    459,816
+  **50k iters, outlier_std 20**    **74.13**  23.35  0.816  0.265    462,103
+  =========================  =============  =====  =====  =====  ==========
+
+  Those are **appearance** scores. After ``validate-usd`` populates the
+  registration error from the placeholder collision mesh, the winner's total
+  becomes 64.13 = 74.13 appearance − 10.0 registration penalty. ``scene_quality
+  .json`` now carries a ``score_breakdown`` so the two are never confused;
+  ``appearance_score`` is the tuner-comparable number.
+
+  Baselines in ``workspace_kitchen/baselines/``; trials in
+  ``workspace_kitchen/tuning/trials.json``; winner promoted to
+  ``configs/kitchen_scene_tuned.yaml``.
+
+- **The cleanup default was destroying quality.** At ``outlier_std: 4.0`` the
+  50k model scored *worse* than the 7k one. The spatial filter is one global
+  median-MAD sphere, so a fixed sigma prunes far harder as a model densifies:
+  it deleted 56% of the Gaussians and tore dark holes through floors and walls
+  (large low-texture areas dominate PSNR/SSIM, so object detail could not
+  compensate). Raising it to 8.0 recovered +7.4 points / +5.3 dB PSNR. The curve
+  is flat from 8 to 20, so 8.0 is the knee and is now the default in
+  ``SplatCleanupConfig``, ``SplatCleanupParams``, the GUI schema, and the configs.
+- Isaac renders align object-for-object with ground-truth frames, validating the
+  COLMAP→USD transform, the OpenCV→USD camera flip, intrinsics→aperture mapping,
+  and USD's row-vector matrix convention.
+
+- **Static collision geometry is still a placeholder.** The OpenMVS wrappers fall
+  back to sparse points, so ``static_proxy.ply`` is a **20-vertex, 36-face hull**
+  spanning the whole (outlier-inflated) point cloud. That is why
+  ``splat_proxy_registration`` reports a ~12.6-unit median error. It does not
+  affect the splat's appearance, but the scene is NOT physics-ready until the
+  dense path works. Preview builds do not require this check, so
+  ``build_report.json`` still says ``usable: true`` — that is preview semantics,
+  not a production pass.
+
+Floater investigation (2026-07-26) — measured, not guessed
+----------------------------------------------------------
+Reported symptom: from outside the scene, stray splats obstruct the view; some
+objects have floating splats. Held-out PSNR/SSIM **cannot see this** — every
+held-out camera sits inside the capture path, so exterior obstruction is
+invisible to it. ``tools/isaac/render_orbit.py`` was added to look from outside.
+
+Interior PSNR (baseline with no floater filters = 23.35 dB), exterior judged
+from orbit renders:
+
+  ===========================================  ==========  =====================
+  cleanup configuration                        interior     exterior
+  ===========================================  ==========  =====================
+  none (opacity + outlier_std only)              23.35      halo + haze
+  **crop 0.5 + max_scale_frac 0.08**           **22.62**    far halo gone
+  + needle 8.0 + density 2                       17.49      noticeably cleaner
+  aggressive (scale 0.02, crop 0.25, density 3)  15.46      cleanest
+  ===========================================  ==========  =====================
+
+Conclusions:
+
+- Deleting the **far halo** (~12k Gaussians beyond the observed volume) and the
+  ~1k scene-sized blobs costs **0.73 dB** — effectively free. These are now the
+  only cleanup filters on by default.
+- Deleting the **haze** (spikes, isolated Gaussians near scene edges) costs
+  3-6 dB. Those Gaussians genuinely contribute to observed views, so this is a
+  real trade, not a free win. ``min_neighbors``, ``max_needle_ratio`` and
+  ``min_view_count`` therefore default to OFF, documented with their cost.
+- Root cause of the remaining haze is representational, not a cleanup bug: a
+  3DGS model is only valid **inside the volume it was observed from**. Rendering
+  an inside-out room capture from outside asks for view directions that have no
+  training data, where view-dependent SH produces garbage. Fix it at capture
+  (wider coverage, 360 camera) or accept exterior views are out of domain.
+- Frustum-visibility trimming (the cheap approximation of TrimGS) does **not**
+  discriminate here: the median Gaussian is seen by 208 of 787 cameras, and only
+  0.3% by two or fewer, because room-interior frusta radiate outward over the
+  halo and no occlusion is resolved. 3DGRUT ships the real thing —
+  ``threedgrut/export/scripts/filter_visibility.py`` accumulates per-Gaussian
+  ``mog_visibility`` from actual renders — which is the correct next step.
+
+Two bugs found by running this for real, both fixed:
+
+1. ``tools/isaac/render_heldout.py`` produced zero images — ``app.update()`` does
+   not trigger Replicator annotators; a synchronous ``rep.orchestrator.step()``
+   per view is required. ``--limit N`` added for fast smoke tests.
+2. The floor gate used inlier ratio, which cannot distinguish a good floor from a
+   broken one (kitchen 6.1% vs desk 3.9%). Replaced by
+   ``geometry.max_points_below_floor`` (kitchen 2.4% vs desk 34.4%).
+
+ROOT CAUSE of the (unusable) desk build (2026-07-26)
+-----------------------------------------------------
+The desk scan is **not tunable — it must be recaptured**. COLMAP registered
+**2 of 113 frames**; the whole workspace is built on those two views:
+
+- ``IMG_0056.mov``: 219 s, 6571 frames → 113 extracted (the rest dropped as
+  blurry); surviving frames have median Laplacian variance ~67 (sharp ≈ 300+),
+  so the footage is soft throughout, and 113 frames over 219 s leaves ~1.9 s
+  between views — far too little overlap for feature matching.
+- Consequences: 1640-point sparse cloud; degenerate intrinsics (fx 6763 vs
+  fy 4192 on 1920×1080); floor plane fit to 64 points (3.9% inliers) that sits
+  mid-cloud, not on any surface; 0.226 m splat-vs-proxy registration error.
+- Recapture guidance: slow continuous motion, locked exposure/focus, plenty of
+  overlap, good light; then ``--video-stride 8`` (~800 candidate frames) and
+  confirm ``reconstruct`` reports a high registration rate before building.
+
 Pending
 -------
 - **True metric scale** — use ``scan2usd apply-metric-scale`` after measuring a

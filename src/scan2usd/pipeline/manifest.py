@@ -218,6 +218,35 @@ class SceneManifest:
     def artifact(self, artifact_id: str) -> ArtifactRecord | None:
         return next((a for a in self.artifacts if a.artifact_id == artifact_id), None)
 
+    def colmap_to_usd_hash(self) -> str | None:
+        """
+        Short provenance hash of the current COLMAP→USD matrix.
+
+        Baked artifacts store this in metadata as ``transform_hash`` so stages can
+        detect that geometry was baked under a transform that has since changed
+        (e.g. floor alignment re-run after packaging) and must be re-baked.
+        """
+        from scan2usd.geometry.frames import FRAME_COLMAP, FRAME_USD, TransformGraph
+
+        graph = TransformGraph()
+        for transform in self.transforms:
+            graph.add(
+                transform.source_frame,
+                transform.target_frame,
+                transform.matrix,
+                evidence=transform.evidence,
+                confidence=transform.confidence,
+            )
+        try:
+            matrix = graph.resolve(FRAME_COLMAP, FRAME_USD)
+        except KeyError:
+            return None
+        import numpy as np
+
+        rounded = np.round(np.asarray(matrix, dtype=np.float64), 9)
+        payload = json.dumps(rounded.tolist(), separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
     def approve(self, gate: str, *, reviewer: str, notes: str = "") -> None:
         self.approvals[gate] = {
             "state": "approved",
@@ -231,7 +260,7 @@ class SceneManifest:
         if not entry or entry.get("state") != "approved":
             raise RuntimeError(f"Manifest gate {gate!r} has not been approved")
 
-    def require_production_ready(self) -> None:
+    def require_production_ready(self, *, require_objects: bool = True) -> None:
         if self.build_mode != "production":
             return
         if not self.scale.is_metric():
@@ -253,7 +282,10 @@ class SceneManifest:
             raise RuntimeError(
                 "Production USD requires an approved COLMAP→USD metric transform"
             ) from None
-        if not any(obj.review_state == "approved" for obj in self.objects):
+        if require_objects and not any(
+            obj.review_state == "approved" for obj in self.objects
+        ):
             raise RuntimeError(
-                "Production USD requires at least one object marked approved in Review"
+                "Production USD requires at least one object marked approved in Review "
+                "(or segmentation.allow_no_objects for environment-only scenes)"
             )

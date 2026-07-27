@@ -14,6 +14,7 @@ from scan2usd.config import (
     QAConfig,
     ReconstructionConfig,
     SegmentationConfig,
+    TuningConfig,
     UsdConfig,
 )
 from scan2usd_gui.schema import (
@@ -145,6 +146,7 @@ def test_reconstruction_and_nested_fields_have_config_paths():
         (UsdConfig, "usd"),
         (QAConfig, "qa"),
         (CaptureConfig, "capture"),
+        (TuningConfig, "tuning"),
     ]:
         required |= _dataclass_leaf_paths(cls, prefix)
     missing = required - schema_paths

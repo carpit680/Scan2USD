@@ -1,0 +1,30 @@
+{
+  // Editors watch recursively and ignore .gitignore when doing so. Without these
+  // excludes, workspace/isaac_env (~33k dirs) + .venv (~8k) + scan workspaces
+  // consume nearly the whole Linux inotify budget (fs.inotify.max_user_watches),
+  // and other tools — Vite's dev server especially — then fail with ENOSPC.
+  "files.watcherExclude": {
+    "**/.venv/**": true,
+    "**/workspace/**": true,
+    "**/workspace_*/**": true,
+    "**/node_modules/**": true,
+    "**/.git/objects/**": true,
+    "**/.git/subtree-cache/**": true,
+    "**/.pytest_cache/**": true,
+    "**/.ruff_cache/**": true,
+    "**/__pycache__/**": true,
+    "**/runs/**": true
+  },
+  "search.exclude": {
+    "**/.venv": true,
+    "**/workspace": true,
+    "**/workspace_*": true,
+    "**/node_modules": true,
+    "**/runs": true
+  },
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    "**/.ruff_cache": true
+  }
+}

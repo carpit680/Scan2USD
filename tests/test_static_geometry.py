@@ -68,3 +68,30 @@ def test_nvblox_contract_includes_masks_manifest(tmp_path):
     assert "--static-only" in args
     assert "--depth-dir" in args
     assert str(cfg.geometry.voxel_size_m) in args
+
+
+def test_poisson_mesh_from_points_recovers_a_plane():
+    """A flat slab of points must come back as a surface, not a balloon."""
+    import numpy as np
+    from scan2usd.geometry.static_scene import poisson_mesh_from_points
+
+    rng = np.random.default_rng(3)
+    xy = rng.uniform(-2.0, 2.0, size=(6000, 2))
+    pts = np.column_stack([xy[:, 0], xy[:, 1], rng.normal(0.0, 0.002, 6000)])
+    mesh = poisson_mesh_from_points(pts, depth=7)
+    verts = np.asarray(mesh.vertices)
+    assert len(verts) > 100
+    # Reconstructed surface stays near the plane it was fit to.
+    assert float(np.percentile(np.abs(verts[:, 2]), 90)) < 0.35
+
+
+def test_geometry_backend_name_follows_config():
+    from scan2usd.config import SceneConfig
+    from scan2usd.geometry.static_scene import _geometry_backend_name
+
+    cfg = SceneConfig()
+    assert _geometry_backend_name(cfg) == "openmvs"
+    cfg.reconstruction.rgb_geometry_backend = "splat"
+    assert _geometry_backend_name(cfg) == "splat"
+    cfg.capture.modality = "rgbd"
+    assert _geometry_backend_name(cfg) == "nvblox"

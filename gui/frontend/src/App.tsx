@@ -6,6 +6,7 @@ import { ConfigPage } from "./pages/ConfigPage";
 import { CommandsPage } from "./pages/CommandsPage";
 import { ReviewPage } from "./pages/ReviewPage";
 import { MetricScalePage } from "./pages/MetricScalePage";
+import { TuningPage } from "./pages/TuningPage";
 import { ArtifactsPage } from "./pages/ArtifactsPage";
 import { DoctorPage } from "./pages/DoctorPage";
 import { GuidePage } from "./pages/GuidePage";
@@ -20,6 +21,7 @@ export default function App() {
         <Route path="commands" element={<CommandsPage />} />
         <Route path="review" element={<ReviewPage />} />
         <Route path="metric" element={<MetricScalePage />} />
+        <Route path="tuning" element={<TuningPage />} />
         <Route path="artifacts" element={<ArtifactsPage />} />
         <Route path="doctor" element={<DoctorPage />} />
         <Route path="guide" element={<GuidePage />} />

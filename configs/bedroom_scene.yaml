@@ -1,0 +1,158 @@
+name: bedroom
+video_path: /home/arpit/Scan2USD/workspace_bedroom/uploads/bedroom_scene.MOV
+workspace_dir: workspace_bedroom
+process_data:
+  num_downscales: 2
+classes:
+- bed
+- pillow
+- chair
+- table
+- lamp
+- book
+- door
+- mirror
+yolo_model: yolov8n.pt
+seed: 42
+capture:
+  modality: rgb
+  depth_dir: null
+  lidar_path: null
+  calibration_path: null
+  clean_plate_dir: null
+  object_capture_dirs: {}
+  scale_anchor_m: null
+reconstruction:
+  visual_backend: 3dgrut
+  rgbd_geometry_backend: nvblox
+  # Collision mesh fitted to the splat's own Gaussian centres rather than a
+  # separate multi-view-stereo run. Two reasons: OpenMVS collapses on white
+  # walls (the kitchen produced a 20-vertex hull), and a separate reconstruction
+  # has to be registered against the splat — that drift measured 12.6 units.
+  # Fitting the surface to the Gaussians makes it aligned by construction.
+  rgb_geometry_backend: splat
+  min_registration_rate: 0.7
+  # Laplacian blur filtering is DISABLED for this capture: the metric is
+  # resolution-dependent and meaningless at 4K (the same sharp frame scores ~20 at
+  # 720p and ~3.5 at 4K), so a 720p-tuned threshold of 50 would reject 95% of
+  # perfectly sharp footage.
+  blur_threshold: 0
+  # Feature count is what actually predicts COLMAP success, and it is
+  # resolution-independent. Measured on this capture (normalised to 1280px):
+  # median 822 features, but the worst quartile is under 263 — long stretches
+  # pointed at blank white ceiling and walls. Those frames are sharp and useless.
+  # 300 drops roughly the worst 27%.
+  min_frame_features: 300
+  # 0 = keep native, which is what THIS run used (frames were already extracted
+  # at 4K before the option existed). For a fresh capture set 1920: the distro
+  # COLMAP is built WITHOUT CUDA (`colmap --help` reports "without CUDA"), so
+  # SIFT is CPU-bound regardless of --use_gpu, and COLMAP clamps its own working
+  # size to 3200px anyway — so 4K pixels are decoded and then discarded.
+  # Pair frame_max_dim: 1920 with grut_downscale: 1.
+  frame_max_dim: 0
+  # Train at half resolution (1080x1920). Cost per iteration scales with pixels:
+  # 4K is ~9x a 720p frame, which would put 50k iterations into the many-hours
+  # range and press hard on 8 GB. Half-res is still 2.25x the kitchen's detail.
+  # COLMAP intrinsics are rescaled to match automatically.
+  # Frames on disk are 4K, so halve them at staging: training cost scales with
+  # pixels per iteration and 4K would be ~9x a 720p frame (many hours at 50k).
+  # 1080x1920 is still 2.25x the kitchen's detail. COLMAP intrinsics are
+  # rescaled to match automatically.
+  grut_downscale: 2
+  grut_config: apps/colmap_3dgut_mcmc.yaml
+  grut_max_iterations: 50000
+  held_out_ratio: 0.1
+  preview_allow_unobserved_background: false
+  grut_overrides:
+  - scheduler.positions.max_steps=50000
+  - strategy.relocate.end_iteration=25000
+  - strategy.add.end_iteration=25000
+  - strategy.perturb.end_iteration=45000
+  - strategy.add.max_n_gaussians=1000000
+  - loss.lambda_ssim=0.25
+  - model.progressive_training.increase_frequency=500
+  usd_splat_format: nurec
+  splat_cleanup:
+    enabled: true
+    outlier_std: 8
+    min_opacity: 0.01
+    max_scale: null
+    max_scale_frac: 0.08
+    crop_margin: 0.5
+    min_neighbors: 0
+    max_needle_ratio: null
+    min_view_count: 0
+segmentation:
+  proposal_model: yolov8s-worldv2.pt
+  mask_model: sam2
+  min_views_per_object: 3
+  review_required: true
+  allow_no_objects: true
+geometry:
+  voxel_size_m: 0.02
+  target_static_triangles: 500000
+  target_object_triangles: 100000
+  simplify_ratio: 0.35
+  rgb_only_requires_scale: true
+  max_points_below_floor: 0.1
+  min_floor_inlier_ratio: 0.02
+materials:
+  texture_resolution: 4096
+  author_baked_variant: true
+  author_pbr_variant: true
+  estimate_lighting: true
+  hdr_path: null
+physics:
+  default_density_kg_m3: 700
+  default_friction: 0.5
+  default_restitution: 0.05
+  dynamic_collider: convexDecomposition
+  vhacd_max_hulls: 32
+  vhacd_resolution: 100000
+usd:
+  root_filename: bedroom.usd
+  isaac_version: '6.0'
+  meters_per_unit: 1
+  up_axis: Z
+  default_look: pbr
+  render_mode: hybrid
+  binary_mesh_layers: false
+qa:
+  required: true
+  min_background_coverage: 0.9
+  allow_background_holes: true
+  max_registration_error_m: 0.03
+  max_depth_error_m: 0.05
+  min_texture_coverage: 0.9
+  max_dynamic_collider_faces: 20000
+  require_held_out_renders: true
+  require_isaac_validation: true
+tuning:
+  max_cheap_trials: 6
+  max_retrain_trials: 0
+  lpips: true
+  cheap_params:
+    crop_margin:
+    - 0.25
+    - 0.5
+    - 1
+    max_scale_frac:
+    - 0.05
+    - 0.08
+external:
+  colmap: /home/arpit/Scan2USD/workspace/colmap-cuda/bin/colmap
+  ns_process_data: ns-process-data
+  ns_train: ns-train
+  ns_render: ns-render
+  grut_python: /home/arpit/Scan2USD/workspace/external/3dgrut/.venv/bin/python
+  grut_root: /home/arpit/Scan2USD/workspace/external/3dgrut
+  nvblox: nvblox
+  openmvs_interface: /home/arpit/Scan2USD/workspace/bin/InterfaceCOLMAP
+  openmvs_densify: /home/arpit/Scan2USD/workspace/bin/DensifyPointCloud
+  openmvs_reconstruct: /home/arpit/Scan2USD/workspace/bin/ReconstructMesh
+  openmvs_refine: /home/arpit/Scan2USD/workspace/bin/RefineMesh
+  openmvs_texture: TextureMesh
+  sam2_runner: /home/arpit/Scan2USD/.venv/bin/python /home/arpit/Scan2USD/tools/segmentation/sam2_runner.py
+    --max-objects 15 --batch-size 2
+  object_reconstruction_runner: /home/arpit/Scan2USD/.venv/bin/python /home/arpit/Scan2USD/tools/geometry/masked_object_recon.py
+  isaac_python: /home/arpit/Scan2USD/workspace/isaac_env/bin/python

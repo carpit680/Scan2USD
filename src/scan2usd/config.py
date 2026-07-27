@@ -229,19 +229,45 @@ class SplatCleanupConfig:
     """Post-export ParticleField stray-Gaussian cleanup."""
 
     enabled: bool = True
-    outlier_std: float = 4.0
+    # Measured on the kitchen scan (50k-iteration model, 940k Gaussians): 4.0 cut
+    # 56% of them and tore dark holes in floors/walls, scoring 66.7; 8.0 kept the
+    # geometry and scored 74.1 (PSNR 18.0 -> 23.3). The spatial filter is a single
+    # global median-MAD sphere, so a fixed sigma gets more destructive as a model
+    # densifies. Over-pruning wrecks large low-texture areas; under-pruning only
+    # leaves a few floaters — so default to the safe side and tune per scene.
+    outlier_std: float = 8.0
     min_opacity: float = 0.01
     max_scale: float | None = None
+    # Targeted anti-floater filters. Held-out PSNR/SSIM cannot see these problems
+    # (every held-out camera sits inside the capture path, where floaters hide
+    # behind or beside the view), so they are governed by defaults rather than by
+    # the tuner: giant Gaussians and the halo shell are never wanted.
+    max_scale_frac: float | None = 0.08
+    crop_margin: float | None = 0.5
+    min_neighbors: int = 0
+    neighbor_radius_frac: float = 0.01
+    max_needle_ratio: float | None = None
+    needle_min_length_frac: float = 0.005
+    min_view_count: int = 0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> SplatCleanupConfig:
         raw = data or {}
         max_scale = raw.get("max_scale", None)
+        scale_frac = raw.get("max_scale_frac", 0.08)
+        crop = raw.get("crop_margin", 0.5)
         return cls(
             enabled=bool(raw.get("enabled", True)),
-            outlier_std=float(raw.get("outlier_std", 4.0)),
+            outlier_std=float(raw.get("outlier_std", 8.0)),
             min_opacity=float(raw.get("min_opacity", 0.01)),
             max_scale=None if max_scale is None else float(max_scale),
+            max_scale_frac=None if scale_frac is None else float(scale_frac),
+            crop_margin=None if crop is None else float(crop),
+            min_neighbors=int(raw.get("min_neighbors", 0)),
+            neighbor_radius_frac=float(raw.get("neighbor_radius_frac", 0.01)),
+            max_needle_ratio=(None if raw.get("max_needle_ratio") is None else float(raw["max_needle_ratio"])),
+            needle_min_length_frac=float(raw.get("needle_min_length_frac", 0.005)),
+            min_view_count=int(raw.get("min_view_count", 0)),
         )
 
     def to_params(self):
@@ -252,6 +278,13 @@ class SplatCleanupConfig:
             outlier_std=self.outlier_std,
             min_opacity=self.min_opacity,
             max_scale=self.max_scale,
+            max_scale_frac=self.max_scale_frac,
+            crop_margin=self.crop_margin,
+            min_neighbors=self.min_neighbors,
+            neighbor_radius_frac=self.neighbor_radius_frac,
+            max_needle_ratio=self.max_needle_ratio,
+            needle_min_length_frac=self.needle_min_length_frac,
+            min_view_count=self.min_view_count,
         )
 
 
@@ -262,10 +295,35 @@ class ReconstructionConfig:
     visual_backend: str = "3dgrut"
     rgbd_geometry_backend: str = "nvblox"
     rgb_geometry_backend: str = "openmvs"
+    # "nurec" = Omniverse neural-volume format (NVIDIA's own Isaac path, carries
+    # render bounds); "standard" = UsdVol ParticleField3DGaussianSplat.
+    # Divide staged training images by this factor before 3DGRUT sees them.
+    # Cost per iteration scales with pixels: a 4K frame is ~9x a 720p one, so 4K
+    # at 50k iterations runs for many hours. 2 is a good balance on 8 GB.
+    grut_downscale: int = 1
+    usd_splat_format: str = "nurec"
     grut_config: str = "apps/colmap_3dgut.yaml"
     grut_max_iterations: int = 30000
     held_out_ratio: float = 0.1
     preview_allow_unobserved_background: bool = True
+    # Fail `reconstruct` when COLMAP registers fewer than this fraction of the input
+    # frames. A 2-of-113 reconstruction still produces artifacts that look "built"
+    # but are fit to a couple of views. Set 0 to disable the gate.
+    min_registration_rate: float = 0.5
+    # Laplacian-variance floor for keeping a video frame. Resolution-dependent —
+    # the same sharp frame scores ~20 at 720p and ~3.5 at 4K — so prefer
+    # min_frame_features on high-resolution or mixed captures. 0 disables.
+    blur_threshold: float = 50.0
+    # Minimum SIFT keypoints (measured at a fixed 1280px) for a frame to be kept.
+    # Rejects sharp-but-textureless frames (blank walls, ceilings) that cannot
+    # register in COLMAP. Resolution-independent. 0 disables.
+    min_frame_features: int = 0
+    # Downscale extracted frames to this longest edge (0 = native). The distro
+    # COLMAP has no CUDA, so SIFT is CPU-bound and cost scales with pixels;
+    # COLMAP also clamps its own working size to 3200px. Extracting 4K at 1920
+    # cut estimated feature extraction from 2.4 h to 0.9 h with no loss, since
+    # training runs at that resolution anyway.
+    frame_max_dim: int = 0
     splat_cleanup: SplatCleanupConfig = field(default_factory=SplatCleanupConfig)
     # Extra Hydra ``key=value`` overrides appended to 3DGRUT train.py (quality knobs).
     grut_overrides: list[str] = field(default_factory=list)
@@ -282,12 +340,18 @@ class ReconstructionConfig:
             visual_backend=str(raw.get("visual_backend", "3dgrut")).lower(),
             rgbd_geometry_backend=str(raw.get("rgbd_geometry_backend", "nvblox")).lower(),
             rgb_geometry_backend=str(raw.get("rgb_geometry_backend", "openmvs")).lower(),
+            grut_downscale=int(raw.get("grut_downscale", 1)),
+            usd_splat_format=str(raw.get("usd_splat_format", "nurec")).lower(),
             grut_config=str(raw.get("grut_config", "apps/colmap_3dgut.yaml")),
             grut_max_iterations=int(raw.get("grut_max_iterations", 30000)),
             held_out_ratio=float(raw.get("held_out_ratio", 0.1)),
             preview_allow_unobserved_background=bool(
                 raw.get("preview_allow_unobserved_background", True)
             ),
+            min_registration_rate=float(raw.get("min_registration_rate", 0.5)),
+            blur_threshold=float(raw.get("blur_threshold", 50.0)),
+            min_frame_features=int(raw.get("min_frame_features", 0)),
+            frame_max_dim=int(raw.get("frame_max_dim", 0)),
             splat_cleanup=SplatCleanupConfig.from_dict(raw.get("splat_cleanup")),
             grut_overrides=overrides,
         )
@@ -300,6 +364,9 @@ class SegmentationConfig:
     masks_dir: Path | None = None
     min_views_per_object: int = 3
     review_required: bool = True
+    # Allow environment-only builds (zero approved movables). Max-photorealism mode:
+    # nothing is masked out of the splat and no placeholder object meshes are packaged.
+    allow_no_objects: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None, base: Path) -> SegmentationConfig:
@@ -310,6 +377,7 @@ class SegmentationConfig:
             masks_dir=_nested_path(raw.get("masks_dir"), base),
             min_views_per_object=int(raw.get("min_views_per_object", 3)),
             review_required=bool(raw.get("review_required", True)),
+            allow_no_objects=bool(raw.get("allow_no_objects", False)),
         )
 
 
@@ -320,6 +388,18 @@ class GeometryConfig:
     target_object_triangles: int = 100_000
     simplify_ratio: float = 0.35
     rgb_only_requires_scale: bool = True
+    # Floor-plane sanity. The load-bearing check is max_points_below_floor: a real
+    # floor has the scene resting on it. Inlier ratio is only a degeneracy guard —
+    # a valid room floor is often just 5-10% of the points, so gating on it rejects
+    # good scans (measured: good kitchen 6.1% vs broken desk 3.9% — indistinguishable,
+    # while points-below separates them 2% vs 34%).
+    max_points_below_floor: float = 0.10
+    min_floor_inlier_ratio: float = 0.02
+    # Used when reconstruction.rgb_geometry_backend == "splat": surface is fit to
+    # the Gaussian centres, so it shares the splat's frame with no registration
+    # step. Higher min_opacity keeps only Gaussians that sit on real surfaces.
+    splat_mesh_depth: int = 10
+    splat_mesh_min_opacity: float = 0.3
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> GeometryConfig:
@@ -330,6 +410,10 @@ class GeometryConfig:
             target_object_triangles=int(raw.get("target_object_triangles", 100_000)),
             simplify_ratio=float(raw.get("simplify_ratio", 0.35)),
             rgb_only_requires_scale=bool(raw.get("rgb_only_requires_scale", True)),
+            max_points_below_floor=float(raw.get("max_points_below_floor", 0.10)),
+            min_floor_inlier_ratio=float(raw.get("min_floor_inlier_ratio", 0.02)),
+            splat_mesh_depth=int(raw.get("splat_mesh_depth", 10)),
+            splat_mesh_min_opacity=float(raw.get("splat_mesh_min_opacity", 0.3)),
         )
 
 
@@ -398,6 +482,34 @@ class UsdConfig:
             default_look=str(raw.get("default_look", "pbr")).lower(),
             render_mode=str(raw.get("render_mode", "hybrid")).lower(),
             binary_mesh_layers=bool(raw.get("binary_mesh_layers", True)),
+        )
+
+
+@dataclass
+class TuningConfig:
+    """Auto-tuner budgets and parameter spaces (see scan2usd tune)."""
+
+    max_cheap_trials: int = 12
+    # Retrain trials re-run 3DGRUT training (hours each on GPU); opt-in.
+    max_retrain_trials: int = 0
+    lpips: bool = True
+    # Optional {param: [values, …]} overrides of the built-in search spaces.
+    cheap_params: dict[str, list[Any]] = field(default_factory=dict)
+    retrain_params: dict[str, list[Any]] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> TuningConfig:
+        raw = data or {}
+        return cls(
+            max_cheap_trials=int(raw.get("max_cheap_trials", 12)),
+            max_retrain_trials=int(raw.get("max_retrain_trials", 0)),
+            lpips=bool(raw.get("lpips", True)),
+            cheap_params={
+                str(k): list(v) for k, v in dict(raw.get("cheap_params") or {}).items()
+            },
+            retrain_params={
+                str(k): list(v) for k, v in dict(raw.get("retrain_params") or {}).items()
+            },
         )
 
 
@@ -510,6 +622,7 @@ class SceneConfig:
     physics: PhysicsConfig = field(default_factory=PhysicsConfig)
     usd: UsdConfig = field(default_factory=UsdConfig)
     qa: QAConfig = field(default_factory=QAConfig)
+    tuning: TuningConfig = field(default_factory=TuningConfig)
 
     @classmethod
     def load(cls, path: Path) -> SceneConfig:
@@ -572,6 +685,7 @@ class SceneConfig:
             physics=PhysicsConfig.from_dict(p("physics", None)),
             usd=UsdConfig.from_dict(p("usd", None), base),
             qa=QAConfig.from_dict(p("qa", None)),
+            tuning=TuningConfig.from_dict(p("tuning", None)),
         )
         if cfg.usd.output_dir is None:
             cfg.usd.output_dir = (

@@ -138,7 +138,7 @@ def test_prepare_grut_dataset_writes_inverted_object_masks(tmp_path):
     assert held_out["images"][0]["file"] == "frame_000.jpg"
 
 
-def test_grut_args_request_standard_particle_field(tmp_path):
+def test_grut_args_request_nurec_volume_by_default(tmp_path):
     cfg = _scene(tmp_path)
     manifest = SceneManifest.create(
         scene_name="room",
@@ -152,7 +152,7 @@ def test_grut_args_request_standard_particle_field(tmp_path):
         output_dir=tmp_path / "out",
         output_usd=tmp_path / "out" / "splat.usd",
     )
-    assert "export_usd.format=standard" in args
+    assert "export_usd.format=nurec" in args
     assert "export_usd.sorting_mode_hint=rayHitDistance" in args
     assert "dataset.test_split_interval=4" in args
 
@@ -199,3 +199,63 @@ def test_reconstruction_config_loads_grut_overrides():
         "scheduler.positions.max_steps=30000",
         "loss.lambda_ssim=0.25",
     ]
+
+
+def test_grut_args_use_configured_usd_splat_format(tmp_path):
+    """NuRec is the default export; 'standard' stays available as an override."""
+    from scan2usd.config import SceneConfig
+    from scan2usd.reconstruction.grut import GrutDataset, grut_train_args
+
+    dataset = GrutDataset(
+        root=tmp_path,
+        images_dir=tmp_path / "images",
+        sparse_dir=tmp_path / "sparse",
+        held_out_manifest=tmp_path / "held_out.json",
+        test_split_interval=10,
+        masked_pixels_fraction=0.0,
+    )
+    cfg = SceneConfig()
+    args = grut_train_args(cfg, dataset, output_dir=tmp_path, output_usd=tmp_path / "s.usd")
+    assert "export_usd.format=nurec" in args
+
+    cfg.reconstruction.usd_splat_format = "standard"
+    args = grut_train_args(cfg, dataset, output_dir=tmp_path, output_usd=tmp_path / "s.usd")
+    assert "export_usd.format=standard" in args
+
+
+def test_downscaled_sparse_rescales_intrinsics(tmp_path, monkeypatch):
+    """Staged images and COLMAP intrinsics must be downscaled together."""
+    from scan2usd.config import SceneConfig
+    from scan2usd.reconstruction import grut
+
+    txt = tmp_path / "convert" / "txt"
+    txt.mkdir(parents=True)
+    (txt / "cameras.txt").write_text(
+        "# comment\n1 OPENCV 3840 2160 1000 1000 1920 1080 0.1 0.2 0.3 0.4\n"
+    )
+    captured = {}
+
+    class FakeAdapter:
+        def __init__(self, *a, **k): pass
+        def run(self, *args, **kwargs): captured.setdefault("calls", []).append(args)
+
+    monkeypatch.setattr(grut, "ExternalToolAdapter", FakeAdapter)
+    monkeypatch.setattr(grut, "resolve_colmap", lambda cfg: "colmap")
+    monkeypatch.setattr(grut.shutil, "rmtree", lambda *a, **k: None)
+
+    src = tmp_path / "sparse"
+    (src / "0").mkdir(parents=True)
+    target = tmp_path / "out"
+    # Pre-create the txt the converter would have written.
+    monkeypatch.setattr(
+        grut.Path, "is_file", lambda self: self.name == "cameras.txt" or Path.is_file(self)
+    )
+    (target / "_colmap_convert" / "txt").mkdir(parents=True)
+    (target / "_colmap_convert" / "txt" / "cameras.txt").write_text(
+        "1 OPENCV 3840 2160 1000 1000 1920 1080 0.1 0.2 0.3 0.4\n"
+    )
+    grut._materialize_grut_sparse(SceneConfig(), src, target, downscale=2)
+    line = (target / "_colmap_convert" / "txt" / "cameras.txt").read_text().split("\n")[0].split()
+    assert line[1] == "PINHOLE"
+    assert line[2:4] == ["1920", "1080"]          # image size halved
+    assert [float(v) for v in line[4:8]] == [500.0, 500.0, 960.0, 540.0]  # fx fy cx cy halved

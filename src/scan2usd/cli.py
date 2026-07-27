@@ -25,8 +25,9 @@ from scan2usd.preprocess.video import (
     frames_dir_has_images,
     is_supported_video_suffix,
     keyframe_subsample,
+    list_frame_images,
 )
-from scan2usd.reconstruction.colmap_io import export_colmap_to_txt
+from scan2usd.reconstruction.colmap_io import export_colmap_to_txt, parse_images_txt
 from scan2usd.reconstruction.external_cli import resolve_colmap
 from scan2usd.reconstruction.nerfstudio import (
     find_latest_splat_config,
@@ -49,6 +50,12 @@ def preprocess(
     stride: int = typer.Option(1, help="Frame stride when extracting from video"),
     keyframe_every: int = typer.Option(1, help="Keep every Nth kept frame after blur filter"),
     max_frames: Optional[int] = typer.Option(None),
+    blur_threshold: Optional[float] = typer.Option(
+        None,
+        "--blur-threshold",
+        help="Laplacian-variance floor (default: reconstruction.blur_threshold). "
+        "Raise to keep only sharp frames; lower to keep softer footage.",
+    ),
 ) -> None:
     """Video (MP4, MOV, …) → frames (blur filter + optional stride)."""
     cfg = SceneConfig.load(config)
@@ -62,7 +69,15 @@ def preprocess(
             err=True,
         )
     cfg.frames_dir.mkdir(parents=True, exist_ok=True)
-    paths = extract_frames(Path(cfg.video_path), cfg.frames_dir, stride=stride, max_frames=max_frames)
+    paths = extract_frames(
+        Path(cfg.video_path),
+        cfg.frames_dir,
+        stride=stride,
+        max_frames=max_frames,
+        blur_threshold=(
+            blur_threshold if blur_threshold is not None else cfg.reconstruction.blur_threshold
+        ),
+    )
     paths = keyframe_subsample(paths, keyframe_every)
     typer.echo(f"Wrote {len(paths)} frames to {cfg.frames_dir}")
 
@@ -101,6 +116,25 @@ def reconstruct(
         help="Re-extract frames from video into frames_dir (overwrite existing JPEGs) and re-run "
         "ns-process-data. Requires video_path.",
     ),
+    min_registration_rate: Optional[float] = typer.Option(
+        None,
+        "--min-registration-rate",
+        help="Fail if COLMAP registers fewer than this fraction of input frames "
+        "(default: reconstruction.min_registration_rate; 0 disables).",
+    ),
+    blur_threshold: Optional[float] = typer.Option(
+        None,
+        "--blur-threshold",
+        help="Laplacian-variance floor when auto-extracting frames "
+        "(default: reconstruction.blur_threshold; lower keeps softer frames).",
+    ),
+    min_features: Optional[int] = typer.Option(
+        None,
+        "--min-features",
+        help="Drop frames with fewer than this many SIFT features — catches sharp "
+        "but textureless frames (blank walls/ceilings) that cannot register. "
+        "Default: reconstruction.min_frame_features.",
+    ),
 ) -> None:
     """``ns-process-data`` → optional ``ns-train splatfacto``; export COLMAP TXT for lifting."""
     cfg = SceneConfig.load(config)
@@ -129,6 +163,17 @@ def reconstruct(
             cfg.frames_dir,
             stride=video_stride,
             max_frames=cap,
+            blur_threshold=(
+                blur_threshold
+                if blur_threshold is not None
+                else cfg.reconstruction.blur_threshold
+            ),
+            min_features=(
+                min_features
+                if min_features is not None
+                else cfg.reconstruction.min_frame_features
+            ),
+            max_dim=cfg.reconstruction.frame_max_dim,
         )
     if skip_process_data:
         if force:
@@ -147,6 +192,26 @@ def reconstruct(
     cfg.colmap_txt_dir.mkdir(parents=True, exist_ok=True)
     export_colmap_to_txt(sparse, cfg.colmap_txt_dir, colmap_bin=resolve_colmap(cfg))
     typer.echo(f"COLMAP TXT at {cfg.colmap_txt_dir}")
+
+    registered = len(parse_images_txt(cfg.colmap_txt_dir / "images.txt"))
+    candidates = len(list_frame_images(cfg.frames_dir))
+    rate = registered / candidates if candidates else 0.0
+    typer.echo(f"COLMAP registered {registered}/{candidates} frames ({rate:.0%})")
+    threshold = (
+        min_registration_rate
+        if min_registration_rate is not None
+        else cfg.reconstruction.min_registration_rate
+    )
+    if threshold > 0 and rate < threshold:
+        raise typer.BadParameter(
+            f"COLMAP registered only {registered}/{candidates} frames ({rate:.0%}), below the "
+            f"{threshold:.0%} minimum. Everything downstream (floor plane, splat, collision "
+            "geometry) would be fit to these few views and look built but be wrong. "
+            "Usual causes: motion blur, too-large gaps between frames, textureless surfaces. "
+            "Try a denser/sharper extraction (e.g. --video-stride 8 --blur-threshold 100), "
+            "or recapture with slower motion and locked exposure/focus. "
+            "Pass --min-registration-rate 0 to proceed anyway."
+        )
     if not skip_train:
         ckpt = ns_train_splatfacto(
             cfg,
@@ -939,7 +1004,8 @@ def validate_usd_cmd(
         None,
         exists=True,
         file_okay=False,
-        help="Isaac renders for cameras listed in build/grut_dataset/held_out.json",
+        help="Isaac renders for cameras in build/grut_dataset/held_out.json "
+        "(default: build/heldout_renders when present — run render-heldout first)",
     ),
     isaac: bool = typer.Option(True, "--isaac/--no-isaac", help="Run headless Isaac physics tests"),
 ) -> None:
@@ -950,6 +1016,11 @@ def validate_usd_cmd(
     cfg = SceneConfig.load(config)
     manifest_path = cfg.workspace_dir / "scene_manifest.json"
     manifest = SceneManifest.load(manifest_path)
+    if held_out_renders is None:
+        default_renders = cfg.workspace_dir / "build" / "heldout_renders"
+        if default_renders.is_dir():
+            held_out_renders = default_renders
+            typer.echo(f"Using held-out renders from {default_renders}")
     try:
         report = validate_usd(
             cfg,
@@ -960,6 +1031,152 @@ def validate_usd_cmd(
     finally:
         manifest.save(manifest_path)
     typer.echo(f"usable={report['usable']} report={cfg.usd.output_dir / 'build_report.json'}")
+
+
+@app.command("render-heldout")
+def render_heldout(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+    output: Optional[Path] = typer.Option(
+        None,
+        help="Render output dir (default: <workspace>/build/heldout_renders)",
+    ),
+    evaluate: bool = typer.Option(
+        True,
+        "--evaluate/--no-evaluate",
+        help="Compute PSNR/SSIM/LPIPS + scene_quality.json after rendering",
+    ),
+    lpips: bool = typer.Option(
+        True,
+        "--lpips/--no-lpips",
+        help="Include LPIPS (needs torchmetrics; slower)",
+    ),
+) -> None:
+    """
+    Render the packaged USD in headless Isaac at held-out capture cameras.
+
+    Compares the real scene the camera saw against what Isaac renders — the
+    ground-truth photorealism metric. Requires external.isaac_python, a packaged
+    root USD, and build/grut_dataset/held_out.json.
+    """
+    from scan2usd.eval.scene_quality import build_scene_quality_report
+    from scan2usd.pipeline.manifest import SceneManifest
+    from scan2usd.reconstruction.external_cli import ExternalToolAdapter, resolve_external_command
+
+    cfg = SceneConfig.load(config)
+    manifest_path = cfg.workspace_dir / "scene_manifest.json"
+    manifest = SceneManifest.load(manifest_path)
+    root_artifact = manifest.artifact("root_usd")
+    if root_artifact is None or not Path(root_artifact.path).is_file():
+        raise typer.BadParameter("No packaged root USD; run build-usd / package-usd first")
+    heldout_spec = cfg.workspace_dir / "build" / "grut_dataset" / "held_out.json"
+    if not heldout_spec.is_file():
+        raise typer.BadParameter(
+            f"Missing {heldout_spec}; run build-visual-usd (3DGRUT dataset staging) first"
+        )
+    if not (cfg.colmap_txt_dir / "images.txt").is_file():
+        raise typer.BadParameter(
+            f"Missing COLMAP TXT under {cfg.colmap_txt_dir}; run reconstruct first"
+        )
+    prefix = resolve_external_command(cfg, "isaac_python", default="python.sh", required=True)
+    assert prefix is not None
+    out_dir = output or (cfg.workspace_dir / "build" / "heldout_renders")
+    script = Path(__file__).resolve().parents[2] / "tools" / "isaac" / "render_heldout.py"
+    adapter = ExternalToolAdapter("isaac_python", prefix)
+    adapter.run(
+        str(script),
+        "--stage",
+        str(Path(root_artifact.path).resolve()),
+        "--held-out",
+        str(heldout_spec.resolve()),
+        "--colmap-txt",
+        str(cfg.colmap_txt_dir.resolve()),
+        "--manifest",
+        str(manifest_path.resolve()),
+        "--output",
+        str(out_dir.resolve()),
+    )
+    typer.echo(f"Renders under {out_dir}")
+    if evaluate:
+        report = build_scene_quality_report(cfg, render_dir=out_dir, compute_lpips=lpips)
+        photo = report["photorealism"]
+        typer.echo(
+            f"quality_score={report['quality_score']} "
+            f"psnr={photo['mean_psnr']} ssim={photo['mean_ssim']} lpips={photo['mean_lpips']} "
+            f"({photo['evaluated_views']}/{photo['expected_views']} views)"
+        )
+
+
+@app.command("quality-report")
+def quality_report(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+    lpips: bool = typer.Option(True, "--lpips/--no-lpips", help="Include LPIPS if available"),
+) -> None:
+    """Recompute scene_quality.json from artifacts on disk (no rendering)."""
+    from scan2usd.eval.scene_quality import build_scene_quality_report
+
+    cfg = SceneConfig.load(config)
+    report = build_scene_quality_report(cfg, compute_lpips=lpips)
+    out = Path(cfg.usd.output_dir or cfg.workspace_dir / "usd") / "scene_quality.json"
+    typer.echo(f"quality_score={report['quality_score']} report={out}")
+
+
+@app.command("tune")
+def tune(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+    cheap_trials: Optional[int] = typer.Option(
+        None, help="Override tuning.max_cheap_trials (splat-cleanup sweep, no retrain)"
+    ),
+    retrain_trials: Optional[int] = typer.Option(
+        None,
+        help="Override tuning.max_retrain_trials (3DGRUT retrains — hours per trial)",
+    ),
+    promote: bool = typer.Option(
+        True,
+        "--promote/--no-promote",
+        help="Write the winner to <config>_tuned.yaml when finished",
+    ),
+    lpips: Optional[bool] = typer.Option(
+        None, "--lpips/--no-lpips", help="Override tuning.lpips"
+    ),
+) -> None:
+    """
+    Auto-tune the scene config against the Isaac photorealism quality score.
+
+    Loop: adjust parameters → re-export/package the USD → render held-out views
+    in Isaac → score → next trial. Resumable: completed trials are read from
+    workspace/tuning/trials.json and skipped. Requires a packaged scene,
+    environment_splat_raw.usd, held_out.json, and external.isaac_python.
+    """
+    from scan2usd.tuning.runner import run_tuning
+
+    cfg = SceneConfig.load(config)
+    raw_splat = cfg.workspace_dir / "build" / "visual" / "environment_splat_raw.usd"
+    if not raw_splat.is_file():
+        raise typer.BadParameter(
+            f"Missing {raw_splat}; run build-usd (with splat_cleanup enabled) first"
+        )
+    summary = run_tuning(
+        cfg,
+        config.resolve(),
+        max_cheap_trials=cheap_trials
+        if cheap_trials is not None
+        else cfg.tuning.max_cheap_trials,
+        max_retrain_trials=retrain_trials
+        if retrain_trials is not None
+        else cfg.tuning.max_retrain_trials,
+        cheap_space=cfg.tuning.cheap_params or None,
+        retrain_space=cfg.tuning.retrain_params or None,
+        compute_lpips=lpips if lpips is not None else cfg.tuning.lpips,
+        promote=promote,
+        log=typer.echo,
+    )
+    typer.echo(
+        f"best={summary['best_trial']} score={summary['best_score']} "
+        f"params={summary['best_params']}"
+    )
+    if summary["promoted_config"]:
+        typer.echo(f"Promoted config: {summary['promoted_config']}")
+    typer.echo(f"Trials: {summary['trials_json']}")
 
 
 @app.command()

@@ -204,13 +204,26 @@ def load_colmap_points_and_up(sparse_model: Path) -> tuple[np.ndarray, np.ndarra
     return xyz, up, images
 
 
+def camera_centers_from_images(images: dict) -> np.ndarray:
+    """World-space camera centers ``C = -R.T @ t`` from COLMAP world→camera poses."""
+    centers: list[np.ndarray] = []
+    for pose in images.values():
+        r_w2c = quat_to_rotmat(pose.qvec)
+        centers.append(-(r_w2c.T @ pose.tvec))
+    if not centers:
+        return np.zeros((0, 3), dtype=np.float64)
+    return np.stack(centers, axis=0)
+
+
 def estimate_floor_alignment(
     sparse_model: Path,
     *,
     distance_thresh: float = 0.04,
     seed: int = 0,
+    min_inlier_ratio: float = 0.0,
+    max_points_below: float = 1.0,
 ) -> FloorAlignment:
-    points, up, _images = load_colmap_points_and_up(sparse_model)
+    points, up, images = load_colmap_points_and_up(sparse_model)
     floor = fit_floor_plane(
         points,
         up,
@@ -219,6 +232,38 @@ def estimate_floor_alignment(
     )
     matrix = colmap_to_usd_from_floor(floor, points)
     aligned = (matrix[:3, :3] @ points.T).T + matrix[:3, 3]
+
+    # Geometric sanity beats inlier count. A real floor has the scene sitting on
+    # top of it, so almost nothing is below it. Inlier ratio alone does not
+    # discriminate: a good kitchen scan and a broken desk scan both sit near 5%,
+    # while "fraction below the plane" separates them 2% vs 34%.
+    below_fraction = float(np.mean(aligned[:, 2] < -distance_thresh))
+    centers = camera_centers_from_images(images)
+    cameras_above = (
+        float(np.mean((centers @ floor.normal) > floor.offset)) if len(centers) else 1.0
+    )
+    if below_fraction > max_points_below:
+        raise RuntimeError(
+            f"Floor plane is not the ground: {below_fraction:.0%} of COLMAP points lie "
+            f"below it (maximum {max_points_below:.0%}). The RANSAC plane is floating "
+            "through the scene rather than supporting it, so every baked mesh would be "
+            "misplaced. Usual cause: too little of the real floor was captured, or the "
+            "reconstruction is too sparse to find it. Capture more floor, or approve an "
+            "explicit transform with set-metric-transform."
+        )
+    if floor.inlier_ratio < min_inlier_ratio:
+        raise RuntimeError(
+            f"Floor plane is unreliable: only {floor.inlier_ratio:.1%} of COLMAP points "
+            f"are inliers (minimum {min_inlier_ratio:.1%}) — the fit is degenerate. "
+            "Capture more of the actual floor, or raise --distance-thresh if the scene "
+            "units are small relative to reconstruction noise."
+        )
+    if cameras_above < 0.9:
+        raise RuntimeError(
+            f"Estimated floor is above {1 - cameras_above:.0%} of camera positions — "
+            "the RANSAC plane is likely a ceiling/table surface, not the ground. "
+            "Re-capture with the floor visible or supply set-metric-transform."
+        )
     report = {
         "source_frame": FRAME_COLMAP,
         "target_frame": FRAME_USD,
@@ -226,6 +271,8 @@ def estimate_floor_alignment(
         "floor_offset": floor.offset,
         "floor_inliers": floor.inlier_count,
         "floor_inlier_ratio": floor.inlier_ratio,
+        "points_below_floor_fraction": below_fraction,
+        "cameras_above_floor_fraction": cameras_above,
         "up_hint_colmap": floor.up_hint.tolist(),
         "aligned_z_percentiles": np.percentile(aligned[:, 2], [1, 5, 50, 95, 99]).tolist(),
         "aligned_xy_median": np.median(aligned[:, :2], axis=0).tolist(),

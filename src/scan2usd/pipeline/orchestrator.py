@@ -155,6 +155,21 @@ class PipelineOrchestrator:
         artifact = self.manifest.artifact(artifact_id)
         return bool(artifact and Path(artifact.path).is_file())
 
+    def _baked_ready(self, artifact_id: str) -> bool:
+        """
+        Ready check for artifacts baked under the COLMAP→USD transform.
+
+        Returns False when the manifest transform changed after the bake (or the
+        artifact predates transform-hash stamping), forcing a coherent re-bake.
+        """
+        artifact = self.manifest.artifact(artifact_id)
+        if not (artifact and Path(artifact.path).is_file()):
+            return False
+        current = self.manifest.colmap_to_usd_hash()
+        if current is None:
+            return True
+        return artifact.metadata.get("transform_hash") == current
+
     def _instance_masks_ready(self) -> bool:
         """True only when the mask report exists and on-disk mask PNGs are present."""
         if not self._artifact_ready("instance_masks"):
@@ -222,7 +237,12 @@ class PipelineOrchestrator:
         out = self.cfg.workspace_dir / "colmap_to_usd_floor.json"
 
         def estimate() -> Path:
-            alignment = estimate_floor_alignment(sparse, distance_thresh=distance_thresh)
+            alignment = estimate_floor_alignment(
+                sparse,
+                distance_thresh=distance_thresh,
+                min_inlier_ratio=self.cfg.geometry.min_floor_inlier_ratio,
+                max_points_below=self.cfg.geometry.max_points_below_floor,
+            )
             write_alignment_json(alignment, out)
             value = alignment.colmap_to_usd
             self.manifest.transforms = [
@@ -380,12 +400,13 @@ class PipelineOrchestrator:
             for obj in self.manifest.objects
             if obj.review_state == "approved"
         ]
-        if not approved:
+        if not approved and not self.cfg.segmentation.allow_no_objects:
             if not self._instance_masks_ready():
                 self.segment(force=force)
             raise ReviewRequired(
                 "Mark keepers as approved in Review (status dropdown), then re-run build-usd: "
-                f"scan2usd review {self.config_path}"
+                f"scan2usd review {self.config_path}. For an environment-only build "
+                "(everything stays in the splat), set segmentation.allow_no_objects: true."
             )
 
         self.run_stage(
@@ -404,7 +425,7 @@ class PipelineOrchestrator:
                 manifest_path=self.manifest_path,
             ),
             force=force,
-            ready=lambda: self._artifact_ready("static_collision_mesh"),
+            ready=lambda: self._baked_ready("static_collision_mesh"),
         )
         for obj in self.manifest.objects:
             if not obj.movable or obj.review_state != "approved":
@@ -417,7 +438,7 @@ class PipelineOrchestrator:
                     obj_id,
                 ),
                 force=force,
-                ready=lambda obj_id=obj.instance_id: self._artifact_ready(
+                ready=lambda obj_id=obj.instance_id: self._baked_ready(
                     f"object_{obj_id}_collision"
                 ),
             )
@@ -444,7 +465,7 @@ class PipelineOrchestrator:
             "usd_package",
             lambda: build_usd_package(self.cfg, self.manifest),
             force=force,
-            ready=lambda: self._artifact_ready("root_usd"),
+            ready=lambda: self._baked_ready("root_usd"),
         )
         self._save()
         if root is None:

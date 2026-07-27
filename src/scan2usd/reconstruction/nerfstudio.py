@@ -90,6 +90,11 @@ def ns_process_data_images(
         str(output_dir.resolve()),
         "--num-downscales",
         str(pd.num_downscales),
+        # Without this, Nerfstudio calls whatever bare ``colmap`` is on PATH and
+        # ``external.colmap`` is silently ignored for the stage that uses COLMAP
+        # most — which is how a CUDA build can sit installed and never get used.
+        "--colmap-cmd",
+        resolve_colmap(cfg),
     ]
     run_cmd(cmd)
 

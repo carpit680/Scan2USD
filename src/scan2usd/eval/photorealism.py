@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
@@ -44,13 +45,24 @@ def ssim(reference: np.ndarray, rendered: np.ndarray) -> float:
     return float(np.mean(value))
 
 
-def _lpips(reference: np.ndarray, rendered: np.ndarray) -> float | None:
+@lru_cache(maxsize=1)
+def _lpips_metric():
+    """Build the LPIPS network once — it is reused across images and tuner trials."""
     try:
-        import torch
         from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
     except ImportError:
         return None
-    metric = LearnedPerceptualImagePatchSimilarity(net_type="alex", normalize=True)
+    return LearnedPerceptualImagePatchSimilarity(net_type="alex", normalize=True)
+
+
+def _lpips(reference: np.ndarray, rendered: np.ndarray) -> float | None:
+    try:
+        import torch
+    except ImportError:
+        return None
+    metric = _lpips_metric()
+    if metric is None:
+        return None
     ref = torch.from_numpy(reference).permute(2, 0, 1).unsqueeze(0)
     out = torch.from_numpy(rendered).permute(2, 0, 1).unsqueeze(0)
     with torch.no_grad():

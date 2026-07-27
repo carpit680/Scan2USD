@@ -187,6 +187,111 @@ def _run_openmvs(cfg: SceneConfig, *, work_dir: Path) -> tuple[Path, str]:
     return source, FRAME_COLMAP
 
 
+def _geometry_backend_name(cfg: SceneConfig) -> str:
+    if cfg.capture.modality in {"rgbd", "lidar"}:
+        return "nvblox"
+    return cfg.reconstruction.rgb_geometry_backend
+
+
+def poisson_mesh_from_points(
+    points: np.ndarray,
+    *,
+    depth: int = 10,
+    density_quantile: float = 0.05,
+    normal_neighbours: int = 30,
+):
+    """
+    Watertight-ish surface through a point cloud via Poisson reconstruction.
+
+    ``density_quantile`` trims the vertices Poisson had to invent where it saw no
+    points — without it, Poisson closes every opening with a balloon of
+    unsupported geometry, which for a room means sealing doorways the robot
+    should be able to drive through.
+    """
+    import open3d as o3d
+
+    cloud = o3d.geometry.PointCloud()
+    cloud.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
+    cloud.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamKNN(knn=normal_neighbours)
+    )
+    cloud.orient_normals_consistent_tangent_plane(k=normal_neighbours)
+
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        cloud, depth=depth
+    )
+    densities = np.asarray(densities)
+    if len(densities) and density_quantile > 0:
+        mesh.remove_vertices_by_mask(densities < np.quantile(densities, density_quantile))
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_duplicated_vertices()
+    mesh.remove_non_manifold_edges()
+    return mesh
+
+
+def _run_splat_geometry(
+    cfg: SceneConfig,
+    manifest: SceneManifest,
+    *,
+    work_dir: Path,
+) -> tuple[Path, str]:
+    """Build collision geometry from the splat's own Gaussians (no separate MVS)."""
+    from scan2usd.reconstruction.external_cli import ExternalToolAdapter, resolve_external_command
+
+    artifact = manifest.artifact("environment_splat")
+    if artifact is None or not Path(artifact.path).is_file():
+        raise RuntimeError(
+            "rgb_geometry_backend='splat' needs the environment splat; "
+            "run build-visual-usd first"
+        )
+    work_dir.mkdir(parents=True, exist_ok=True)
+    cloud_path = work_dir / "splat_points.ply"
+
+    prefix = resolve_external_command(cfg, "isaac_python", default="python.sh", required=True)
+    assert prefix is not None
+    script = Path(__file__).resolve().parents[3] / "tools" / "geometry" / "splat_to_pointcloud.py"
+    ExternalToolAdapter("isaac_python", prefix).run(
+        str(script),
+        "--input",
+        str(Path(artifact.path).resolve()),
+        "--output",
+        str(cloud_path.resolve()),
+        "--min-opacity",
+        str(cfg.geometry.splat_mesh_min_opacity),
+        "--report",
+        str((work_dir / "splat_points_report.json").resolve()),
+    )
+    if not cloud_path.is_file():
+        raise FileNotFoundError(f"Gaussian point dump failed: {cloud_path}")
+
+    import open3d as o3d
+
+    cloud = o3d.io.read_point_cloud(str(cloud_path))
+    points = np.asarray(cloud.points)
+    if len(points) < 1000:
+        raise RuntimeError(f"Only {len(points)} usable Gaussian centres; cannot build a surface")
+    mesh = poisson_mesh_from_points(points, depth=cfg.geometry.splat_mesh_depth)
+    out = work_dir / "splat_surface.ply"
+    o3d.io.write_triangle_mesh(str(out), mesh)
+    (work_dir / "splat_mesh_report.json").write_text(
+        json.dumps(
+            {
+                "input_points": int(len(points)),
+                "vertices": int(len(mesh.vertices)),
+                "triangles": int(len(mesh.triangles)),
+                "poisson_depth": cfg.geometry.splat_mesh_depth,
+                "note": "Derived from Gaussian centres, so it shares the splat's frame exactly.",
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # Gaussians live in the splat's own (COLMAP) frame, so the usual transform applies.
+    return out, FRAME_COLMAP
+
+
 def build_static_scene(
     cfg: SceneConfig,
     manifest: SceneManifest,
@@ -202,6 +307,8 @@ def build_static_scene(
             manifest_path=manifest_path,
             output_mesh=build_root / "nvblox" / "static_raw.ply",
         )
+    elif cfg.reconstruction.rgb_geometry_backend == "splat":
+        raw_mesh, source_frame = _run_splat_geometry(cfg, manifest, work_dir=build_root / "splat")
     else:
         raw_mesh, source_frame = _run_openmvs(cfg, work_dir=build_root / "openmvs")
 
@@ -223,15 +330,17 @@ def build_static_scene(
     proxy_mesh.export(proxy)
     chunks = split_static_mesh(collision_mesh, build_root / "chunks")
 
+    transform_hash = manifest.colmap_to_usd_hash()
     manifest.register_artifact(
         artifact_id="static_collision_mesh",
         kind="triangle_collision_mesh",
         path=collision,
-        producer="nvblox" if cfg.capture.modality in {"rgbd", "lidar"} else "openmvs",
+        producer=_geometry_backend_name(cfg),
         metadata={
             "source_frame": source_frame,
             "static": True,
             "collision_approximation": "none",
+            "transform_hash": transform_hash,
             "report": collision_report.__dict__,
         },
     )
@@ -240,7 +349,10 @@ def build_static_scene(
         kind="render_proxy_mesh",
         path=proxy,
         producer="scan2usd.mesh_ops",
-        metadata={"report": mesh_report(proxy_mesh, proxy).__dict__},
+        metadata={
+            "transform_hash": transform_hash,
+            "report": mesh_report(proxy_mesh, proxy).__dict__,
+        },
     )
     for name, path in chunks.items():
         manifest.register_artifact(
@@ -251,7 +363,7 @@ def build_static_scene(
             metadata={"chunk": name},
         )
     report = {
-        "backend": "nvblox" if cfg.capture.modality in {"rgbd", "lidar"} else "openmvs",
+        "backend": _geometry_backend_name(cfg),
         "raw_mesh": str(raw_mesh.resolve()),
         "source_frame": source_frame,
         "collision": str(collision.resolve()),

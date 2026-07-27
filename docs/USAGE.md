@@ -190,6 +190,45 @@ Production consumers only read the approved `scene_manifest.json`.
 - `look=pbr` uses a conservative de-lit base-color estimate plus normal, roughness, and metalness maps. This is the default for moving objects and must be reviewed.
 - The ParticleField contains captured radiance. RTX can render it with mesh shadows/reflections, but it is not a fully relightable PBR surface.
 
+### Quality metrics and auto-tuning
+
+The end-metric for photorealism is **Isaac renders at held-out capture cameras vs
+the real frames**:
+
+```bash
+# Render held-out views headlessly in Isaac and score PSNR/SSIM/LPIPS.
+scan2usd render-heldout configs/golden_scene.yaml
+# Re-aggregate scene_quality.json without re-rendering.
+scan2usd quality-report configs/golden_scene.yaml
+```
+
+Camera poses/intrinsics come from the COLMAP TXT model (same raw COLMAP frame as
+the exported splat) mapped through the manifest COLMAP→USD transform — never from
+`transforms.json` (different frame). Results land in
+`workspace/usd/scene_quality.json` (`quality_score` 0–100: SSIM 45% / LPIPS 35% /
+PSNR 20%, with penalties for registration error and failed validation gates) and
+`photorealism_report.json`. `validate-usd` picks up `build/heldout_renders`
+automatically.
+
+**Auto-tuner** (`scan2usd tune`, or the GUI **Tuning** page):
+
+```bash
+scan2usd tune configs/golden_scene.yaml                      # cheap loop only
+scan2usd tune configs/golden_scene.yaml --retrain-trials 2   # + 3DGRUT retrains
+```
+
+- *Cheap loop*: sweeps `splat_cleanup` thresholds by re-cleaning from
+  `environment_splat_raw.usd` (no retraining) → package → Isaac render → score.
+- *Retrain loop* (opt-in): sweeps `grut_max_iterations` / densify schedule; hours
+  of GPU per trial; each trained splat is snapshotted under `workspace/tuning/trials/`.
+- Resumable via `workspace/tuning/trials.json`; the winner is written to
+  `<config>_tuned.yaml` (`--no-promote` to skip). Budgets/spaces live under the
+  `tuning:` YAML section.
+
+`configs/golden_scene.yaml` is the annotated best-practices profile and the
+recommended tuner seed. For maximum photorealism with no manipulable objects,
+it sets `segmentation.allow_no_objects: true` (nothing is masked out of the splat).
+
 ### Validation
 
 `validate-usd` writes `build_report.json` and refuses a production pass when required checks fail:
@@ -878,6 +917,8 @@ TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 ns-render interpolate \
 | `ns-train` unrecognized `--pipeline.datamanager.dataparser.*` | Remove invalid keys from YAML; use `process_data.num_downscales` and `camera_res_scale_factor`. |
 | `torch.load` / `weights_only` error in `ns-viewer` | Use `scan2usd view` or `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1`. |
 | Noisy training log spam | Default fixed (`max-log-size 0`); avoid `--viewer` unless needed. |
+| `reconstruct` fails with "registered only N/M frames" | Working as intended — SfM failed and everything downstream would be fit to a few views. Extract denser/sharper (`--video-stride 8 --blur-threshold 100`) or recapture with slower motion and locked exposure/focus. `--min-registration-rate 0` overrides. |
+| Many frames "dropped below blur threshold" | The video is soft. Lowering `--blur-threshold` keeps more frames but they still won't match in COLMAP; recapture instead. |
 | COLMAP low % registered | More overlap, slower motion, more texture; fewer blurry frames (`preprocess` stride). |
 | COLMAP registered ≈0% after long video | Too many near-duplicate frames: use `reconstruct --video-stride 15 --video-max-frames 600` or `preprocess --stride …` then `reconstruct`. |
 | `CUDA error: invalid argument` early in `ns-train` | Fix COLMAP first (need many registered views). Reboot; `nvidia-smi`; try `CUDA_LAUNCH_BLOCKING=1`; update driver / PyTorch+CUDA stack for RTX 50. |

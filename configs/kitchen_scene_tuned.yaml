@@ -1,8 +1,9 @@
-name: desk
-video_path: /home/arpit/Scan2USD/workspace_desk/uploads/IMG_0056.mov
-workspace_dir: workspace_desk
+# Auto-tuned from kitchen_scene.yaml: best trial cheap_003 (quality_score=74.134).
+name: kitchen
+video_path: /home/arpit/Desktop/scan2.MOV
+workspace_dir: workspace_kitchen
 process_data:
-  num_downscales: 2
+  num_downscales: 1
 splatfacto:
   max_num_iterations: 40000
   experiment_name: splatfacto
@@ -26,31 +27,7 @@ classes:
 - robot
 - robotic arm
 yolo_model: yolov8n.pt
-train_epochs: 3
-train_imgsz: 640
-train_batch: 4
 seed: 42
-split:
-  strategy: session
-  val_sessions: []
-  val_ratio: 0.2
-pose_sampling:
-  num_poses: 64
-  position_jitter_m: 0.05
-  height_jitter_m: 0.02
-  max_rotation_deg: 8
-  interpolation_keyframes: 8
-lift:
-  min_points_in_box: 8
-  merge_center_dist_m: 0.35
-  depth_trim_mad: 2
-  inner_margin_frac: 0.12
-  depth_percentile:
-  - 10
-  - 90
-  percentile:
-  - 5
-  - 95
 capture:
   modality: rgb
   depth_dir: null
@@ -63,30 +40,36 @@ reconstruction:
   visual_backend: 3dgrut
   rgbd_geometry_backend: nvblox
   rgb_geometry_backend: openmvs
+  min_registration_rate: 0.7
+  blur_threshold: 50.0
   grut_config: apps/colmap_3dgut.yaml
   grut_max_iterations: 50000
-  held_out_ratio: 0.05
+  held_out_ratio: 0.1
   preview_allow_unobserved_background: false
   grut_overrides:
   - scheduler.positions.max_steps=50000
+  - strategy.densify.end_iteration=25000
   - loss.lambda_ssim=0.25
-  - strategy.densify.end_iteration=10000
+  - model.progressive_training.increase_frequency=500
   splat_cleanup:
     enabled: true
-    outlier_std: 2
-    min_opacity: 0.05
+    outlier_std: 20.0
+    min_opacity: 0.01
     max_scale: null
 segmentation:
   proposal_model: yolov8s-worldv2.pt
   mask_model: sam2
   min_views_per_object: 3
   review_required: true
+  allow_no_objects: true
 geometry:
   voxel_size_m: 0.02
   target_static_triangles: 500000
   target_object_triangles: 100000
   simplify_ratio: 0.35
   rgb_only_requires_scale: true
+  max_points_below_floor: 0.1
+  min_floor_inlier_ratio: 0.02
 materials:
   texture_resolution: 4096
   author_baked_variant: true
@@ -101,7 +84,7 @@ physics:
   vhacd_max_hulls: 32
   vhacd_resolution: 100000
 usd:
-  root_filename: desk.usd
+  root_filename: kitchen.usd
   isaac_version: '6.0'
   meters_per_unit: 1
   up_axis: Z
@@ -119,7 +102,7 @@ qa:
   require_held_out_renders: true
   require_isaac_validation: true
 external:
-  colmap: /home/arpit/Scan2USD/workspace/colmap-cuda/bin/colmap
+  colmap: colmap
   ns_process_data: ns-process-data
   ns_train: ns-train
   ns_render: ns-render
@@ -135,3 +118,14 @@ external:
     --max-objects 15 --batch-size 2
   object_reconstruction_runner: /home/arpit/Scan2USD/.venv/bin/python /home/arpit/Scan2USD/tools/geometry/masked_object_recon.py
   isaac_python: /home/arpit/Scan2USD/workspace/isaac_env/bin/python
+tuning:
+  max_cheap_trials: 3
+  max_retrain_trials: 0
+  lpips: true
+  cheap_params:
+    outlier_std:
+    - 4.0
+    - 8.0
+    - 20.0
+    min_opacity:
+    - 0.01

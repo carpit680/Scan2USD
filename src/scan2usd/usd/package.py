@@ -353,7 +353,9 @@ def build_usd_package(
     output_dir: Path | None = None,
 ) -> Path:
     if manifest.build_mode == "production":
-        manifest.require_production_ready()
+        manifest.require_production_ready(
+            require_objects=not cfg.segmentation.allow_no_objects
+        )
     output_dir = output_dir or Path(cfg.usd.output_dir or cfg.workspace_dir / "usd")
     output_dir.mkdir(parents=True, exist_ok=True)
     environment = _copy_environment(cfg, manifest, output_dir / "environment")
@@ -387,6 +389,7 @@ def build_usd_package(
             "meters_per_unit": cfg.usd.meters_per_unit,
             "up_axis": cfg.usd.up_axis,
             "objects": len(object_assets),
+            "transform_hash": manifest.colmap_to_usd_hash(),
         },
     )
     manifest.save(output_dir / "scene_manifest.json")

@@ -120,12 +120,16 @@ def finalize_object_mesh(
     obj.physics.update(local_physics)
     obj.physics["approved"] = False
     manifest.upsert_object(obj)
+    transform_hash = manifest.colmap_to_usd_hash()
     manifest.register_artifact(
         artifact_id=f"object_{obj.instance_id}_visual",
         kind="rigid_object_render_mesh",
         path=visual_path,
         producer="scan2usd.object_builder",
-        metadata={"report": asdict(mesh_report(local_mesh, visual_path))},
+        metadata={
+            "transform_hash": transform_hash,
+            "report": asdict(mesh_report(local_mesh, visual_path)),
+        },
     )
     manifest.register_artifact(
         artifact_id=f"object_{obj.instance_id}_collision",
@@ -136,6 +140,7 @@ def finalize_object_mesh(
             "approximation": cfg.physics.dynamic_collider,
             "vhacd_max_hulls": cfg.physics.vhacd_max_hulls,
             "vhacd_resolution": cfg.physics.vhacd_resolution,
+            "transform_hash": transform_hash,
             "report": asdict(mesh_report(collision_mesh, collision_path)),
         },
     )

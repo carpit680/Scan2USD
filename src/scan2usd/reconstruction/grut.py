@@ -28,6 +28,17 @@ class GrutDataset:
     masked_pixels_fraction: float
 
 
+def _stage_image(source: Path, target: Path, downscale: int) -> None:
+    """Copy (or link) a frame into the training set, optionally downscaled."""
+    if downscale <= 1:
+        _link_or_copy(source, target)
+        return
+    with Image.open(source) as image:
+        image = image.convert("RGB")
+        size = (max(1, image.width // downscale), max(1, image.height // downscale))
+        image.resize(size, Image.Resampling.LANCZOS).save(target, quality=95)
+
+
 def _link_or_copy(source: Path, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() or target.is_symlink():
@@ -111,8 +122,20 @@ def _test_interval(ratio: float) -> int:
     return max(2, int(round(1.0 / ratio)))
 
 
-def _materialize_grut_sparse(cfg: SceneConfig, source_sparse: Path, target_sparse: Path) -> None:
-    """Copy COLMAP sparse data and coerce OPENCV intrinsics to PINHOLE for 3DGRUT."""
+def _materialize_grut_sparse(
+    cfg: SceneConfig,
+    source_sparse: Path,
+    target_sparse: Path,
+    downscale: int = 1,
+) -> None:
+    """
+    Copy COLMAP sparse data, coerce OPENCV intrinsics to PINHOLE for 3DGRUT, and
+    rescale them when the staged images were downscaled.
+
+    Intrinsics and image size must agree. Staging half-size images against
+    full-size intrinsics would put every projection in the wrong place while
+    still training happily, so the two are always changed together.
+    """
     model_source = source_sparse / "0"
     if not model_source.is_dir():
         raise FileNotFoundError(f"Missing COLMAP sparse model: {model_source}")
@@ -148,11 +171,13 @@ def _materialize_grut_sparse(cfg: SceneConfig, source_sparse: Path, target_spars
                 continue
             parts = line.split()
             if len(parts) >= 8 and parts[1] == "OPENCV":
-                patched.append(
-                    " ".join([parts[0], "PINHOLE", *parts[2:8]])
-                )
-            else:
-                patched.append(line)
+                parts = [parts[0], "PINHOLE", *parts[2:8]]
+            if downscale > 1 and len(parts) >= 8:
+                width = max(1, int(parts[2]) // downscale)
+                height = max(1, int(parts[3]) // downscale)
+                scaled = [f"{float(v) / downscale:.10g}" for v in parts[4:8]]
+                parts = [parts[0], parts[1], str(width), str(height), *scaled, *parts[8:]]
+            patched.append(" ".join(parts))
         cameras_path.write_text("\n".join(patched) + "\n", encoding="utf-8")
     subprocess.run(
         "model_converter",
@@ -180,6 +205,10 @@ def prepare_grut_dataset(
     """
     root = output_dir or (cfg.workspace_dir / "build" / "grut_dataset")
     validate_background_coverage(cfg, manifest)
+    # Training cost scales with pixels per iteration, not dataset size (3DGRUT
+    # streams one image per step). A 4K capture is ~9x the pixels of a 720p one,
+    # so staging at a reduced resolution is the main lever on training time.
+    downscale = max(1, int(cfg.reconstruction.grut_downscale))
     images_out = root / "images"
     images_out.mkdir(parents=True, exist_ok=True)
 
@@ -223,11 +252,23 @@ def prepare_grut_dataset(
             composited = source.copy()
             foreground = keep == 0
             composited[foreground] = clean[foreground]
-            Image.fromarray(composited).save(staged_image)
+            composited_image = Image.fromarray(composited)
+            if downscale > 1:
+                composited_image = composited_image.resize(
+                    (composited.shape[1] // downscale, composited.shape[0] // downscale),
+                    Image.Resampling.LANCZOS,
+                )
+            composited_image.save(staged_image)
             keep[:] = 255
         else:
-            _link_or_copy(image_path, staged_image)
-        Image.fromarray(keep, mode="L").save(images_out / f"{image_path.stem}_mask.png")
+            _stage_image(image_path, staged_image, downscale)
+        mask_image = Image.fromarray(keep, mode="L")
+        if downscale > 1:
+            mask_image = mask_image.resize(
+                (max(1, keep.shape[1] // downscale), max(1, keep.shape[0] // downscale)),
+                Image.Resampling.NEAREST,
+            )
+        mask_image.save(images_out / f"{image_path.stem}_mask.png")
         total_pixels += int(keep.size)
         masked_pixels += masked
         if interval and index % interval == 0:
@@ -239,7 +280,7 @@ def prepare_grut_dataset(
             sparse_out.unlink()
         else:
             shutil.rmtree(sparse_out)
-    _materialize_grut_sparse(cfg, sparse_source, sparse_out)
+    _materialize_grut_sparse(cfg, sparse_source, sparse_out, downscale)
 
     tjson = find_transforms_json(cfg.nerfstudio_data_dir)
     cameras: dict[str, list[list[float]]] = {}
@@ -264,6 +305,7 @@ def prepare_grut_dataset(
     fraction = masked_pixels / max(total_pixels, 1)
     report = {
         "images": len(images),
+        "downscale": downscale,
         "approved_object_mask_dirs": len(object_mask_dirs),
         "masked_pixels_fraction": fraction,
         "held_out_images": len(held_out),
@@ -330,7 +372,11 @@ def grut_train_args(
         f"n_iterations={cfg.reconstruction.grut_max_iterations}",
         "export_usd.enabled=true",
         f"export_usd.path={output_usd.resolve()}",
-        "export_usd.format=standard",
+        # "nurec" is Omniverse's native neural-volume format and the one NVIDIA's
+        # own Isaac workflows consume; unlike the "standard" ParticleField export
+        # it carries render bounds, so a scene can be clipped for inspection
+        # without deleting Gaussians the observed views still need.
+        f"export_usd.format={cfg.reconstruction.usd_splat_format}",
         # Preserve COLMAP coordinates; the layered scene applies the one audited
         # COLMAP→USD metric transform shared by splats, meshes, and cameras.
         "export_usd.apply_normalizing_transform=false",

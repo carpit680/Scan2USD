@@ -1,0 +1,187 @@
+# Golden profile: the annotated best-photorealism settings for a hybrid USD build.
+# Every quality-relevant choice is explained inline; copy this file per scene.
+#
+# NOTE: the desk capture wired up below is UNUSABLE — COLMAP registers only
+# 2 of 113 frames (soft footage, ~1.9 s between views). It is kept here only so
+# the numbers in the comments stay tied to a real example. For an actual build
+# use configs/kitchen_scene.yaml, which applies this same profile to a capture
+# that reconstructs 100%. See docs/STATUS_HYBRID_USD.md.
+#
+# This is also the auto-tuner's seed config (`scan2usd tune <config>`); the
+# tuner writes its winner to <config>_tuned.yaml.
+#
+# Workflow (GUI Pipeline page, or CLI):
+#   reconstruct → init-usd → align-floor → [review or allow_no_objects]
+#   → build-usd → render-heldout (quality score) → tune → validate-usd
+name: desk
+video_path: /home/arpit/Scan2USD/workspace_desk/uploads/IMG_0056.mov
+workspace_dir: workspace_desk
+
+process_data:
+  # Full-resolution COLMAP inputs. Sharpest splat training data; costs VRAM/disk.
+  # Changing this invalidates COLMAP + training (most expensive knob in the file).
+  num_downscales: 1
+
+# Legacy Splatfacto settings (kept for the ns-train path; unused by 3DGRUT builds).
+splatfacto:
+  max_num_iterations: 40000
+  experiment_name: splatfacto
+  use_bilateral_grid: true
+  background_color: black
+  rasterize_mode: antialiased
+  cull_alpha_thresh: 0.005
+  ssim_lambda: 0.15
+  camera_optimizer_mode: 'off'
+
+classes:
+- cell phone
+- remote
+- laptop
+- monitor
+- speaker
+- keyboard
+- light
+- led
+- tablet
+- mouse
+- robot
+- robotic arm
+yolo_model: yolov8n.pt
+seed: 42
+
+capture:
+  modality: rgb
+  depth_dir: null
+  lidar_path: null
+  calibration_path: null
+  # Strongly recommended for production: same-trajectory pass with movables removed.
+  # Without it, masked-out objects leave unobserved holes in the environment splat.
+  clean_plate_dir: null
+  object_capture_dirs: {}
+  scale_anchor_m: null
+
+reconstruction:
+  visual_backend: 3dgrut
+  rgbd_geometry_backend: nvblox
+  rgb_geometry_backend: openmvs
+  # Quality starts at capture, not at training. A scan where COLMAP registers only a
+  # few frames still produces a scene that *looks* built but is fit to those views —
+  # refuse it early instead of spending GPU hours on it.
+  min_registration_rate: 0.7
+  # Laplacian-variance floor for keeping a frame. Sharp handheld frames score 300+;
+  # a capture whose median is under ~100 is motion-blurred and will not reconstruct.
+  # Raising this does not rescue soft footage — it just leaves fewer frames. Recapture.
+  blur_threshold: 50.0
+  grut_config: apps/colmap_3dgut.yaml
+  # 50k iterations. MEASURED on the kitchen scan: 50k scores 74.1 vs 68.9 for a
+  # 7k run (once cleanup is not over-pruning — see splat_cleanup below, which
+  # inverted this comparison until it was fixed).
+  grut_max_iterations: 50000
+  # 10% held-out views → ~11 evaluation frames on this capture. More views =
+  # steadier quality metric; slightly less training data. (Was 0.05 → only 4 views,
+  # too noisy to tune against.)
+  held_out_ratio: 0.10
+  preview_allow_unobserved_background: false
+  grut_overrides:
+  # LR schedule must span the full run or positions stop optimizing early.
+  - scheduler.positions.max_steps=50000
+  # Densify for the first half: more Gaussians where detail needs them,
+  # then let the second half converge what exists.
+  - strategy.densify.end_iteration=25000
+  # Slightly SSIM-weighted loss: favors structural sharpness over per-pixel L1.
+  - loss.lambda_ssim=0.25
+  # SH degree ramps up every 500 steps → full view-dependent radiance early
+  # enough to matter, late enough not to destabilize.
+  - model.progressive_training.increase_frequency=500
+  splat_cleanup:
+    enabled: true
+    # Primary cheap tuning knob, and the one that mattered most in practice.
+    # MEASURED on the kitchen 50k model: 4.0 removed 56% of Gaussians and tore
+    # dark holes through floors and walls (score 66.7); 8.0 scored 74.1 and 20.0
+    # scored 74.1 — i.e. the curve plateaus by 8, and everything below it is
+    # damage. Tune per scene with `scan2usd tune` (re-cleans from
+    # environment_splat_raw.usd, no retraining needed).
+    outlier_std: 8.0
+    # Drop nearly-invisible Gaussians; 0.01 is conservative (visual no-op).
+    min_opacity: 0.01
+    max_scale: null
+
+segmentation:
+  proposal_model: yolov8s-worldv2.pt
+  mask_model: sam2
+  min_views_per_object: 3
+  review_required: true
+  # Max-photorealism default: keep everything inside the splat. Movables that are
+  # masked out get replaced by reconstructed meshes, which currently look worse
+  # than the splat itself. Flip to false (and approve objects in Review) only
+  # when you need manipulable rigid bodies in Isaac.
+  allow_no_objects: true
+
+geometry:
+  voxel_size_m: 0.02
+  target_static_triangles: 500000
+  target_object_triangles: 100000
+  simplify_ratio: 0.35
+  rgb_only_requires_scale: true
+  # Floor sanity. The load-bearing check is max_points_below_floor: a real floor
+  # has the scene resting on top of it. Measured on real scans — a good kitchen
+  # floor is only 6% of points and a broken desk plane 3.9%, so inlier ratio can
+  # not tell them apart, but points-below separates them 2% vs 34%.
+  max_points_below_floor: 0.10
+  min_floor_inlier_ratio: 0.02   # degeneracy guard only
+
+materials:
+  texture_resolution: 4096
+  author_baked_variant: true
+  author_pbr_variant: true
+  estimate_lighting: true
+  # Supply a real HDR of the room if you have one — the LDR-average dome light
+  # is low-confidence and only affects mesh (not splat) shading.
+  hdr_path: null
+
+physics:
+  default_density_kg_m3: 700
+  default_friction: 0.5
+  default_restitution: 0.05
+  dynamic_collider: convexDecomposition
+  vhacd_max_hulls: 32
+  vhacd_resolution: 100000
+
+usd:
+  root_filename: desk.usd
+  isaac_version: '6.0'
+  meters_per_unit: 1
+  up_axis: Z
+  default_look: pbr
+  render_mode: hybrid
+  binary_mesh_layers: false
+
+qa:
+  required: true
+  min_background_coverage: 0.9
+  # Development convenience; set false (and provide clean_plate_dir) for production.
+  allow_background_holes: true
+  max_registration_error_m: 0.03
+  max_depth_error_m: 0.05
+  min_texture_coverage: 0.9
+  max_dynamic_collider_faces: 20000
+  require_held_out_renders: true
+  require_isaac_validation: true
+
+external:
+  colmap: /home/arpit/Scan2USD/workspace/colmap-cuda/bin/colmap
+  ns_process_data: ns-process-data
+  ns_train: ns-train
+  ns_render: ns-render
+  grut_python: /home/arpit/Scan2USD/workspace/external/3dgrut/.venv/bin/python
+  grut_root: /home/arpit/Scan2USD/workspace/external/3dgrut
+  nvblox: nvblox
+  openmvs_interface: /home/arpit/Scan2USD/workspace/bin/InterfaceCOLMAP
+  openmvs_densify: /home/arpit/Scan2USD/workspace/bin/DensifyPointCloud
+  openmvs_reconstruct: /home/arpit/Scan2USD/workspace/bin/ReconstructMesh
+  openmvs_refine: /home/arpit/Scan2USD/workspace/bin/RefineMesh
+  openmvs_texture: TextureMesh
+  sam2_runner: /home/arpit/Scan2USD/.venv/bin/python /home/arpit/Scan2USD/tools/segmentation/sam2_runner.py
+    --max-objects 15 --batch-size 2
+  object_reconstruction_runner: /home/arpit/Scan2USD/.venv/bin/python /home/arpit/Scan2USD/tools/geometry/masked_object_recon.py
+  isaac_python: /home/arpit/Scan2USD/workspace/isaac_env/bin/python

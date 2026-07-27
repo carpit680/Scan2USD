@@ -163,6 +163,7 @@ export const client = {
   cancelJob: (id: string) =>
     api<JobSnapshot>(`/api/jobs/${id}/cancel`, { method: "POST" }),
   pipelineState: () => api<Record<string, unknown>>("/api/pipeline/state"),
+  tuningTrials: () => api<Record<string, unknown>>("/api/tuning/trials"),
   doctor: () => api<Record<string, unknown>>("/api/doctor"),
   guide: () =>
     api<{

@@ -182,6 +182,28 @@ def export_colmap_to_txt(
     subprocess.run(cmd, check=True)
 
 
+def registered_image_count(sparse_model: Path, colmap_bin: str = "colmap") -> int:
+    """
+    Count images COLMAP registered in a sparse model (BIN or TXT).
+
+    A low count relative to the input frames means SfM failed: everything
+    downstream (floor plane, splat, collision geometry) is then fit to a handful
+    of views and looks plausible while being wrong.
+    """
+    sparse_model = sparse_model.expanduser().resolve()
+    text_model = sparse_model / "images.txt"
+    if text_model.is_file():
+        return len(parse_images_txt(text_model))
+    if not (sparse_model / "images.bin").is_file():
+        raise FileNotFoundError(f"No COLMAP model (images.bin/images.txt) under {sparse_model}")
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="scan2usd_regcount_") as tmp:
+        out = Path(tmp)
+        export_colmap_to_txt(sparse_model, out, colmap_bin=colmap_bin)
+        return len(parse_images_txt(out / "images.txt"))
+
+
 def read_colmap_model(txt_dir: Path) -> tuple[dict[int, CameraIntrinsics], dict[str, ImagePose], np.ndarray, np.ndarray]:
     cams = parse_cameras_txt(txt_dir / "cameras.txt")
     images = parse_images_txt(txt_dir / "images.txt")
