@@ -11,6 +11,7 @@ import yaml
 
 from scan2usd.config import SceneConfig, sync_workspace_paths
 
+from scan2usd_gui.paths import sanitize_project_cwd
 from scan2usd_gui.state import project_state
 
 
@@ -72,7 +73,7 @@ def load_raw_yaml(path: Path) -> dict[str, Any]:
 
 def load_project(config_path: Path, *, cwd: Path | None = None) -> dict[str, Any]:
     path = config_path.resolve()
-    work_cwd = (cwd or Path.cwd()).resolve()
+    work_cwd = sanitize_project_cwd(cwd or project_state.cwd)
     # SceneConfig resolves relative paths against cwd unless paths_relative_to is set
     import os
 
@@ -221,6 +222,9 @@ def workspace_paths(cfg: SceneConfig, *, cwd: Path | None = None) -> dict[str, s
         "environment_splat_raw": d(env_splat_raw),
         "environment_splat_cleanup_input": d(cleanup_input),
         "splat_cleanup_report": d(splat_parent / "splat_cleanup_report.json"),
+        "splat_analysis_report": d(splat_parent / "splat_analysis.json"),
+        "orbit_renders_dir": d(ws / "build" / "orbit_renders"),
+        "colmap_sparse_dir": d(Path(cfg.nerfstudio_data_dir) / "colmap" / "sparse" / "0"),
         "proposals_json": d(ws / "build" / "segmentation" / "proposals.json"),
         "segmentation_dir": d(ws / "build" / "segmentation"),
         "colmap_to_usd_floor": d(ws / "colmap_to_usd_floor.json"),
