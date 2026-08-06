@@ -91,8 +91,29 @@ def transform_mesh(mesh, matrix: np.ndarray | list[list[float]]):
     return transformed
 
 
+def count_components(mesh) -> int:
+    """
+    Number of connected components, without materialising them.
+
+    ``mesh.split()`` builds a full Trimesh per component, copying vertices and
+    faces. On a fragmented Poisson surface that is tens of thousands of meshes
+    and tens of GB of RAM — enough to get the process OOM-killed. Counting via
+    face adjacency touches only index arrays.
+    """
+    trimesh = _trimesh()
+    if not len(mesh.faces):
+        return 0
+    try:
+        labels = trimesh.graph.connected_components(
+            mesh.face_adjacency, node_count=len(mesh.faces)
+        )
+        return int(len(labels))
+    except Exception:  # noqa: BLE001
+        return 1
+
+
 def mesh_report(mesh, path: Path) -> MeshReport:
-    components = mesh.split(only_watertight=False)
+    components_count = count_components(mesh)
     volume = float(abs(mesh.volume)) if mesh.is_watertight else None
     return MeshReport(
         path=str(path.resolve()),
@@ -103,7 +124,7 @@ def mesh_report(mesh, path: Path) -> MeshReport:
         bounds_min=[float(v) for v in mesh.bounds[0]],
         bounds_max=[float(v) for v in mesh.bounds[1]],
         extents_m=[float(v) for v in mesh.extents],
-        components=len(components),
+        components=components_count,
     )
 
 
@@ -130,31 +151,62 @@ def process_mesh_file(
     return report
 
 
-def split_static_mesh(mesh, output_dir: Path) -> dict[str, Path]:
-    """Split connected components into floor, architecture, and obstacle debug chunks."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    components = list(mesh.split(only_watertight=False))
-    if not components:
-        components = [mesh]
-    z_min = float(mesh.bounds[0, 2])
-    groups: dict[str, list] = {"floor": [], "architecture": [], "obstacles": []}
-    for component in components:
-        mean_normal = np.mean(component.face_normals, axis=0) if len(component.faces) else np.zeros(3)
-        low = float(component.bounds[0, 2]) <= z_min + 0.15
-        horizontal = abs(float(mean_normal[2])) >= 0.75
-        if low and horizontal:
-            groups["floor"].append(component)
-        elif float(component.area) >= max(1.0, float(mesh.area) * 0.05):
-            groups["architecture"].append(component)
-        else:
-            groups["obstacles"].append(component)
+def split_static_mesh(mesh, output_dir: Path, *, max_components: int = 2000) -> dict[str, Path]:
+    """
+    Split the mesh into floor, architecture, and obstacle debug chunks.
+
+    Never calls ``mesh.split()``. That builds a full Trimesh per connected
+    component — copying vertices, faces and caches — and on a real 278k-face room
+    surface it consumed 27 GB and did not finish, taking the whole build down with
+    the OOM killer. Components are grouped by face labels instead, so the only
+    copies made are the three chunks actually written.
+    """
     trimesh = _trimesh()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if not len(mesh.faces):
+        return {}
+
+    try:
+        labels = trimesh.graph.connected_components(
+            mesh.face_adjacency, node_count=len(mesh.faces)
+        )
+    except Exception:  # noqa: BLE001
+        labels = [np.arange(len(mesh.faces))]
+    if len(labels) > max_components:
+        print(
+            f"[split_static_mesh] {len(labels):,} components exceeds {max_components:,}; "
+            "skipping debug chunks.",
+            flush=True,
+        )
+        return {}
+
+    z_min = float(mesh.bounds[0, 2])
+    total_area = float(mesh.area)
+    face_normals = mesh.face_normals
+    face_areas = mesh.area_faces
+    triangles_z = mesh.vertices[mesh.faces][:, :, 2]
+
+    groups: dict[str, list[np.ndarray]] = {"floor": [], "architecture": [], "obstacles": []}
+    for face_index in labels:
+        face_index = np.asarray(face_index, dtype=np.int64)
+        mean_normal_z = float(np.mean(face_normals[face_index, 2]))
+        low = float(triangles_z[face_index].min()) <= z_min + 0.15
+        area = float(face_areas[face_index].sum())
+        if low and abs(mean_normal_z) >= 0.75:
+            groups["floor"].append(face_index)
+        elif area >= max(1.0, total_area * 0.05):
+            groups["architecture"].append(face_index)
+        else:
+            groups["obstacles"].append(face_index)
+
     result: dict[str, Path] = {}
     for name, members in groups.items():
         if not members:
             continue
-        combined = clean_mesh(trimesh.util.concatenate(members))
+        chunk = mesh.copy()
+        chunk.update_faces(np.concatenate(members))
+        chunk.remove_unreferenced_vertices()
         path = output_dir / f"{name}.ply"
-        combined.export(path)
+        clean_mesh(chunk).export(path)
         result[name] = path
     return result

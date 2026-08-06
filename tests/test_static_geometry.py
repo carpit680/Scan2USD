@@ -95,3 +95,21 @@ def test_geometry_backend_name_follows_config():
     assert _geometry_backend_name(cfg) == "splat"
     cfg.capture.modality = "rgbd"
     assert _geometry_backend_name(cfg) == "nvblox"
+
+
+def test_split_static_mesh_handles_a_large_mesh_cheaply(tmp_path):
+    """A big mesh must still chunk, and must not fall back to mesh.split()."""
+    import resource
+
+    import trimesh
+    from scan2usd.geometry.mesh_ops import split_static_mesh
+
+    big = trimesh.creation.icosphere(subdivisions=5)
+    while len(big.faces) < 120_000:
+        big = trimesh.util.concatenate([big, trimesh.creation.icosphere(subdivisions=5)])
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    chunks = split_static_mesh(big, tmp_path)
+    after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    assert chunks
+    # Peak growth stays in the hundreds of MB, not the tens of GB mesh.split() used.
+    assert (after - before) / 1048576 < 4.0
