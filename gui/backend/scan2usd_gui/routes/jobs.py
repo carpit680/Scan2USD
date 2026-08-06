@@ -62,7 +62,6 @@ def start_job(body: StartJobBody) -> dict:
             argv = resolve_tool_argv(
                 body.command,
                 options,
-                cwd=project_state.cwd,
                 external={str(k): str(v) for k, v in external.items()},
             )
         else:

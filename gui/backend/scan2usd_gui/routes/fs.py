@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from scan2usd.config import SceneConfig
 
+from scan2usd_gui.paths import repo_root
 from scan2usd_gui.state import project_state
 
 router = APIRouter(prefix="/api/fs", tags=["fs"])
@@ -35,7 +36,7 @@ def _allowed_roots() -> list[Path]:
             roots.append(resolved)
 
     add(project_state.cwd)
-    add(Path.cwd())
+    add(repo_root())
     add(Path.home())
     # Common media mounts on Linux
     for extra in ("/media", "/mnt", "/data"):
@@ -60,7 +61,7 @@ def _allowed_roots() -> list[Path]:
                 pass
 
     # Repo root guess: parent of cwd if it contains configs/
-    for candidate in (project_state.cwd, Path.cwd()):
+    for candidate in (project_state.cwd, repo_root()):
         if (candidate / "configs").is_dir():
             add(candidate)
         if (candidate.parent / "configs").is_dir():

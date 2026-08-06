@@ -219,12 +219,12 @@ def resolve_tool_argv(
     tool_id: str,
     options: dict[str, Any],
     *,
-    cwd: Path,
     external: dict[str, str] | None = None,
 ) -> list[str]:
     """Build allowlisted ``python <tools/…> …`` argv. Rejects unknown tool ids."""
     import sys
 
+    from scan2usd_gui.paths import repo_root
     from scan2usd_gui.schema import TOOL_DEFS
 
     tool = next((t for t in TOOL_DEFS if t["id"] == tool_id), None)
@@ -235,8 +235,11 @@ def resolve_tool_argv(
     # Hard allowlist: script must be under tools/ and match the registered path
     if not script_rel.startswith("tools/") or ".." in Path(script_rel).parts:
         raise ValueError(f"Refusing non-allowlisted script: {script_rel}")
-    script_path = (cwd / script_rel).resolve()
-    tools_root = (cwd / "tools").resolve()
+    # Anchored to the checkout, not the project cwd: tools/ ships with the code,
+    # while the project cwd is wherever the user's scene data lives.
+    root = repo_root()
+    script_path = (root / script_rel).resolve()
+    tools_root = (root / "tools").resolve()
     if not str(script_path).startswith(str(tools_root) + "/") and script_path != tools_root:
         raise ValueError(f"Script escapes tools/: {script_path}")
     if not script_path.is_file():

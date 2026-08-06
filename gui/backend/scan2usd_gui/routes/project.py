@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from scan2usd.config import SceneConfig
 
 from scan2usd_gui.bridge import load_project, workspace_summary
+from scan2usd_gui.paths import repo_root
 from scan2usd_gui.state import project_state
 
 router = APIRouter(prefix="/api/project", tags=["project"])
@@ -46,7 +47,7 @@ def open_project(body: OpenProjectBody) -> dict:
     path = Path(body.config_path).expanduser()
     if not path.is_file():
         raise HTTPException(404, f"Config not found: {path}")
-    cwd = Path(body.cwd).expanduser() if body.cwd else Path.cwd()
+    cwd = Path(body.cwd).expanduser() if body.cwd else project_state.cwd
     try:
         data = load_project(path, cwd=cwd)
         import os
@@ -78,12 +79,12 @@ def create_project(body: CreateProjectBody) -> dict:
     template = Path(body.template).expanduser()
     if not template.is_file():
         # try relative to repo / cwd
-        cand = Path.cwd() / body.template
+        cand = repo_root() / body.template
         if cand.is_file():
             template = cand
         else:
             raise HTTPException(404, f"Template not found: {body.template}")
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(template.read_text())
-    cwd = Path(body.cwd).expanduser() if body.cwd else Path.cwd()
+    cwd = Path(body.cwd).expanduser() if body.cwd else project_state.cwd
     return open_project(OpenProjectBody(config_path=str(dest), cwd=str(cwd)))
