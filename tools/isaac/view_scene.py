@@ -5,9 +5,14 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import sys
 from pathlib import Path
 
 os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "YES")
+
+# Reuse the pipeline's Gaussian array handling rather than a second copy: packed
+# spherical harmonics and quaternion arrays both need care to filter correctly.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from isaacsim import SimulationApp
 
@@ -166,6 +171,101 @@ def _place_camera_inside(stage, stage_path: Path, args) -> bool:
     return True
 
 
+def _cut_top(stage, fraction: float) -> str | None:
+    """
+    Hide the top ``fraction`` of the scene so you can look down into the room.
+
+    Edits the opened stage in memory only — nothing on disk changes, so this is
+    a view setting rather than a cleanup pass and costs no re-clean to adjust.
+
+    The cut is in **world** Z, not the authored Z: the ParticleField is authored
+    in COLMAP space with the floor-alignment transform applied by an xformOp on
+    the root, so thresholding the raw positions would slice along a tilted plane.
+    Height is taken from the 1-99 percentile of the Gaussians rather than min/max,
+    because a single stray Gaussian far overhead would otherwise put the ceiling
+    outside the cut entirely.
+    """
+    import numpy as np
+    from pxr import Usd, UsdGeom, Vt
+
+    from scan2usd.reconstruction.splat_cleanup import (
+        _load_gaussian_arrays,
+        _write_gaussian_arrays,
+        filter_parallel_arrays,
+    )
+
+    if fraction <= 0.0:
+        return None
+
+    cut_at = None
+    for prim in stage.Traverse():
+        if "ParticleField" not in str(prim.GetTypeName()):
+            continue
+        if not prim.GetAttribute("positions").HasValue():
+            continue
+        loaded = _load_gaussian_arrays(prim)
+        positions = np.asarray(loaded["positions"], dtype=np.float64)
+        if not len(positions):
+            continue
+
+        matrix = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+        rows = np.asarray(matrix, dtype=np.float64)  # row-vector convention
+        world_z = positions @ rows[:3, 2] + rows[3, 2]
+
+        low, high = np.percentile(world_z, [1.0, 99.0])
+        cut_at = float(high - (high - low) * float(fraction))
+        keep = world_z <= cut_at
+
+        _write_gaussian_arrays(
+            prim,
+            filter_parallel_arrays(
+                keep,
+                positions=loaded["positions"],
+                opacities=loaded["opacities"],
+                scales=loaded["scales"],
+                orientations=loaded["orientations"],
+                sh_coeffs=loaded["sh_coeffs"],
+                sh_element_size=loaded["sh_element_size"],
+            ),
+            sh_element_size=loaded["sh_element_size"],
+        )
+        print(
+            f"[scan2usd] cut top {fraction:.0%} at world z={cut_at:.3f}: "
+            f"{int(keep.sum()):,} of {len(positions):,} Gaussians kept",
+            flush=True,
+        )
+
+    # Meshes carry the ceiling too; clip them so the cut is not splat-only.
+    if cut_at is not None:
+        for prim in stage.Traverse():
+            mesh = UsdGeom.Mesh(prim)
+            if not mesh:
+                continue
+            points_attr = mesh.GetPointsAttr()
+            counts_attr = mesh.GetFaceVertexCountsAttr()
+            indices_attr = mesh.GetFaceVertexIndicesAttr()
+            if not (points_attr.HasValue() and counts_attr.HasValue()):
+                continue
+            points = np.asarray(points_attr.Get(), dtype=np.float64)
+            counts = np.asarray(counts_attr.Get(), dtype=np.int64)
+            indices = np.asarray(indices_attr.Get(), dtype=np.int64)
+            if not len(points) or not len(counts) or counts.max() != counts.min():
+                continue
+            rows = np.asarray(
+                UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default()),
+                dtype=np.float64,
+            )
+            world_z = points @ rows[:3, 2] + rows[3, 2]
+            per_face = indices.reshape(len(counts), int(counts[0]))
+            keep_face = np.all(world_z[per_face] <= cut_at, axis=1)
+            if keep_face.all():
+                continue
+            kept = per_face[keep_face].reshape(-1)
+            counts_attr.Set(Vt.IntArray.FromNumpy(counts[keep_face].astype(np.int32)))
+            indices_attr.Set(Vt.IntArray.FromNumpy(kept.astype(np.int32)))
+    return None if cut_at is None else f"{cut_at:.3f}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -176,8 +276,18 @@ def main() -> None:
     parser.add_argument(
         "--ground-marker",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Show a non-colliding translucent plane at Z=0 (Isaac ground)",
+        default=False,
+        help="Show a non-colliding translucent green plane at Z=0. Off by "
+        "default: it was there to confirm floor alignment, which the floor gate "
+        "now checks numerically, and it obscures the actual floor.",
+    )
+    parser.add_argument(
+        "--cut-top-frac",
+        type=float,
+        default=0.0,
+        help="Hide the top fraction of the scene (0.2 removes the ceiling and "
+        "lets you look down into the room). View-only: the stage on disk is "
+        "untouched, so this costs nothing to change.",
     )
     parser.add_argument(
         "--start",
@@ -235,6 +345,11 @@ def main() -> None:
         if args.ground_marker:
             marker = _add_z0_ground_marker(stage)
             print(f"[scan2usd] Z=0 ground marker at {marker}", flush=True)
+
+        if args.cut_top_frac > 0.0:
+            _cut_top(stage, args.cut_top_frac)
+            for _ in range(30):
+                app.update()
 
         default_prim = stage.GetDefaultPrim()
         print(

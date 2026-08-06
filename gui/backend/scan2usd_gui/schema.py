@@ -2363,9 +2363,11 @@ def _tool_opt(
     path_ext: str | None = None,
     default_from: str | None = None,
     config_default_from: str | None = None,
+    **extra: Any,
 ) -> dict[str, Any]:
     return _p(
         enum=enum,
+        **extra,
         id=f"cmd.{tool_id}.{name}",
         label=label,
         type=type,
@@ -2775,7 +2777,21 @@ TOOL_DEFS: list[dict[str, Any]] = [
                 "How far along the capture trajectory to open (0 = first frame, 1 = last).",
                 0.5,
             ),
-            _tool_opt("tool-isaac-view", "ground_marker", "Ground marker", "bool", "Show translucent Z=0 ground plane.", True),
+            _tool_opt("tool-isaac-view", "ground_marker", "Ground marker", "bool", "Show the translucent green Z=0 plane. Off by default: it was there to confirm floor alignment, which is now checked numerically, and it hides the real floor.", False),
+            _tool_opt(
+                "tool-isaac-view",
+                "cut_top_frac",
+                "Cut top of scene",
+                "float",
+                "Hide this fraction of the scene's height so you can look down into "
+                "the room (0.2 takes the ceiling off). View-only \u2014 the stage on "
+                "disk is untouched, so changing it costs nothing.",
+                0.0,
+                min=0.0,
+                max=0.9,
+                step=0.05,
+                widget="slider",
+            ),
         ],
     },
     {
