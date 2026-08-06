@@ -53,6 +53,12 @@ class SplatCleanupParams:
     # Frustum visibility barely discriminates on inside-out room captures (median
     # Gaussian is seen by 208 of 787 cameras); useful for object-centric scans.
     min_view_count: int = 0
+    # Refuse to emit a scene that cleanup has gutted. Removing nearly everything
+    # means either the thresholds are wrong for this model or the model itself is
+    # degenerate — an MCMC run whose relocate schedule ended early leaves ~99% of
+    # Gaussians at zero opacity, and without this the build "succeeds" with an
+    # empty scene. 0 disables the check.
+    min_keep_fraction: float = 0.05
 
 
 @dataclass
@@ -478,6 +484,19 @@ def cleanup_particlefield_file(
         filtered,
         sh_element_size=int(loaded["sh_element_size"]),
     )
+    kept = int(np.count_nonzero(keep))
+    total = int(loaded["positions"].shape[0])
+    if params.min_keep_fraction > 0 and total and kept / total < params.min_keep_fraction:
+        raise RuntimeError(
+            f"Cleanup would keep only {kept:,}/{total:,} Gaussians "
+            f"({kept / total:.2%}, floor {params.min_keep_fraction:.0%}). "
+            f"Removed by: opacity={removed['removed_opacity']:,} "
+            f"scale={removed['removed_scale']:,} crop={removed['removed_crop']:,} "
+            f"needle={removed['removed_needle']:,} density={removed['removed_density']:,}. "
+            "If opacity dominates, the trained model is probably degenerate rather "
+            "than dirty — check the training schedule before lowering min_opacity."
+        )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if not stage.GetRootLayer().Export(str(output_path)):
         raise RuntimeError(f"Failed to export cleaned ParticleField USD: {output_path}")

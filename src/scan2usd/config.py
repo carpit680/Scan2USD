@@ -249,6 +249,7 @@ class SplatCleanupConfig:
     max_needle_ratio: float | None = None
     needle_min_length_frac: float = 0.005
     min_view_count: int = 0
+    min_keep_fraction: float = 0.05
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> SplatCleanupConfig:
@@ -268,6 +269,7 @@ class SplatCleanupConfig:
             max_needle_ratio=(None if raw.get("max_needle_ratio") is None else float(raw["max_needle_ratio"])),
             needle_min_length_frac=float(raw.get("needle_min_length_frac", 0.005)),
             min_view_count=int(raw.get("min_view_count", 0)),
+            min_keep_fraction=float(raw.get("min_keep_fraction", 0.05)),
         )
 
     def to_params(self):
@@ -285,6 +287,7 @@ class SplatCleanupConfig:
             max_needle_ratio=self.max_needle_ratio,
             needle_min_length_frac=self.needle_min_length_frac,
             min_view_count=self.min_view_count,
+            min_keep_fraction=self.min_keep_fraction,
         )
 
 
@@ -295,13 +298,18 @@ class ReconstructionConfig:
     visual_backend: str = "3dgrut"
     rgbd_geometry_backend: str = "nvblox"
     rgb_geometry_backend: str = "openmvs"
-    # "nurec" = Omniverse neural-volume format (NVIDIA's own Isaac path, carries
-    # render bounds); "standard" = UsdVol ParticleField3DGaussianSplat.
     # Divide staged training images by this factor before 3DGRUT sees them.
     # Cost per iteration scales with pixels: a 4K frame is ~9x a 720p one, so 4K
     # at 50k iterations runs for many hours. 2 is a good balance on 8 GB.
     grut_downscale: int = 1
-    usd_splat_format: str = "nurec"
+    # "standard" = UsdVol ParticleField3DGaussianSplat, which exposes per-Gaussian
+    # positions/opacities/scales as USD attributes. Splat cleanup and the
+    # splat-derived collision mesh both read those, so this must stay the default.
+    # "nurec" is Omniverse's neural-volume container: it carries omni:nurec:crop
+    # bounds and Isaac consumes it natively, but it hides the Gaussians inside
+    # opaque OmniNuRecFieldAsset blobs and ALWAYS writes a USDZ regardless of the
+    # requested extension. Use it for final delivery, not for processing.
+    usd_splat_format: str = "standard"
     grut_config: str = "apps/colmap_3dgut.yaml"
     grut_max_iterations: int = 30000
     held_out_ratio: float = 0.1
@@ -341,7 +349,7 @@ class ReconstructionConfig:
             rgbd_geometry_backend=str(raw.get("rgbd_geometry_backend", "nvblox")).lower(),
             rgb_geometry_backend=str(raw.get("rgb_geometry_backend", "openmvs")).lower(),
             grut_downscale=int(raw.get("grut_downscale", 1)),
-            usd_splat_format=str(raw.get("usd_splat_format", "nurec")).lower(),
+            usd_splat_format=str(raw.get("usd_splat_format", "standard")).lower(),
             grut_config=str(raw.get("grut_config", "apps/colmap_3dgut.yaml")),
             grut_max_iterations=int(raw.get("grut_max_iterations", 30000)),
             held_out_ratio=float(raw.get("held_out_ratio", 0.1)),

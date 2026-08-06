@@ -389,6 +389,50 @@ def grut_train_args(
     return args
 
 
+def find_latest_grut_checkpoint(build_root: Path) -> Path | None:
+    """Newest ``ckpt_last.pt`` under a 3DGRUT output directory."""
+    checkpoints = sorted(
+        build_root.rglob("ckpt_last.pt"), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    return checkpoints[0] if checkpoints else None
+
+
+def _recover_export_from_checkpoint(
+    cfg: SceneConfig,
+    build_root: Path,
+    output_usd: Path,
+) -> bool:
+    """
+    Re-run the USD export alone, from the saved checkpoint.
+
+    A fresh process carries none of training's optimizer state, so the export
+    fits in memory that the training process could not spare. Returns False when
+    there is no checkpoint to recover from.
+    """
+    checkpoint = find_latest_grut_checkpoint(build_root)
+    if checkpoint is None:
+        return False
+    adapter, _train = resolve_grut(cfg)
+    args = [
+        "-m",
+        "threedgrut.export.scripts.export_usd",
+        "--checkpoint",
+        str(checkpoint.resolve()),
+        "--output",
+        str(output_usd.resolve()),
+        "--format",
+        cfg.reconstruction.usd_splat_format,
+        "--no-transform",
+        "--no-cameras",
+    ]
+    print(
+        f"[scan2usd] in-process export unavailable; re-exporting from {checkpoint.name}",
+        flush=True,
+    )
+    adapter.run(*args)
+    return output_usd.is_file()
+
+
 def export_environment_particlefield(
     cfg: SceneConfig,
     manifest: SceneManifest,
@@ -398,15 +442,31 @@ def export_environment_particlefield(
     """Train 3DGRUT and export the environment as standard ParticleField USD."""
     dataset = dataset or prepare_grut_dataset(cfg, manifest)
     build_root = cfg.workspace_dir / "build" / "visual"
-    output_usd = build_root / "environment_splat.usd"
+    # NuRec always emits a USDZ container; naming it .usd produces a zip that
+    # OpenUSD refuses to open. Match the extension to the format.
+    suffix = "usdz" if cfg.reconstruction.usd_splat_format == "nurec" else "usd"
+    output_usd = build_root / f"environment_splat.{suffix}"
     output_usd.parent.mkdir(parents=True, exist_ok=True)
     adapter, _train = resolve_grut(cfg)
-    adapter.run(*grut_train_args(cfg, dataset, output_dir=build_root, output_usd=output_usd))
+    try:
+        adapter.run(*grut_train_args(cfg, dataset, output_dir=build_root, output_usd=output_usd))
+    except Exception as exc:  # noqa: BLE001
+        # 3DGRUT exports from inside the training process, which is still holding
+        # the optimizer state, so the export can run out of VRAM even though
+        # training finished. Observed repeatedly on 8 GB: ~7.4 GiB in use, export
+        # asks for another 0.5 GiB and dies. The checkpoint is already on disk at
+        # that point, so re-export in a clean process rather than losing the run.
+        if not _recover_export_from_checkpoint(cfg, build_root, output_usd):
+            raise
+        manifest.warnings.append(
+            f"3DGRUT in-process export failed ({type(exc).__name__}); "
+            "recovered by re-exporting from ckpt_last.pt"
+        )
     if not output_usd.is_file():
         candidates = sorted(build_root.rglob("*.usd")) + sorted(build_root.rglob("*.usdc"))
         if len(candidates) == 1:
             output_usd = candidates[0]
-        else:
+        elif not _recover_export_from_checkpoint(cfg, build_root, output_usd):
             raise FileNotFoundError(
                 f"3DGRUT completed but did not create configured ParticleField USD: {output_usd}"
             )

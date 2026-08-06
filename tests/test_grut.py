@@ -138,7 +138,7 @@ def test_prepare_grut_dataset_writes_inverted_object_masks(tmp_path):
     assert held_out["images"][0]["file"] == "frame_000.jpg"
 
 
-def test_grut_args_request_nurec_volume_by_default(tmp_path):
+def test_grut_args_request_standard_particle_field_by_default(tmp_path):
     cfg = _scene(tmp_path)
     manifest = SceneManifest.create(
         scene_name="room",
@@ -152,7 +152,7 @@ def test_grut_args_request_nurec_volume_by_default(tmp_path):
         output_dir=tmp_path / "out",
         output_usd=tmp_path / "out" / "splat.usd",
     )
-    assert "export_usd.format=nurec" in args
+    assert "export_usd.format=standard" in args
     assert "export_usd.sorting_mode_hint=rayHitDistance" in args
     assert "dataset.test_split_interval=4" in args
 
@@ -216,11 +216,13 @@ def test_grut_args_use_configured_usd_splat_format(tmp_path):
     )
     cfg = SceneConfig()
     args = grut_train_args(cfg, dataset, output_dir=tmp_path, output_usd=tmp_path / "s.usd")
-    assert "export_usd.format=nurec" in args
-
-    cfg.reconstruction.usd_splat_format = "standard"
-    args = grut_train_args(cfg, dataset, output_dir=tmp_path, output_usd=tmp_path / "s.usd")
+    # standard exposes per-Gaussian positions, which cleanup and the collision
+    # mesh both need; nurec hides them in opaque field assets.
     assert "export_usd.format=standard" in args
+
+    cfg.reconstruction.usd_splat_format = "nurec"
+    args = grut_train_args(cfg, dataset, output_dir=tmp_path, output_usd=tmp_path / "s.usdz")
+    assert "export_usd.format=nurec" in args
 
 
 def test_downscaled_sparse_rescales_intrinsics(tmp_path, monkeypatch):
@@ -259,3 +261,45 @@ def test_downscaled_sparse_rescales_intrinsics(tmp_path, monkeypatch):
     assert line[1] == "PINHOLE"
     assert line[2:4] == ["1920", "1080"]          # image size halved
     assert [float(v) for v in line[4:8]] == [500.0, 500.0, 960.0, 540.0]  # fx fy cx cy halved
+
+
+def test_export_recovers_from_checkpoint_when_inline_export_ooms(tmp_path, monkeypatch):
+    """Training finishing but the in-process export dying must not lose the run."""
+    from scan2usd.config import SceneConfig
+    from scan2usd.pipeline.manifest import SceneManifest
+    from scan2usd.reconstruction import grut
+
+    build_root = tmp_path / "workspace" / "build" / "visual"
+    (build_root / "run").mkdir(parents=True)
+    (build_root / "run" / "ckpt_last.pt").write_bytes(b"ckpt")
+    output = build_root / "environment_splat.usd"
+
+    calls = []
+
+    class FakeAdapter:
+        def run(self, *args, **kwargs):
+            calls.append(args)
+            if args and args[0] == "train.py":
+                raise RuntimeError("CUDA out of memory")
+            output.write_text("#usda 1.0\n")  # the recovery export succeeds
+
+    monkeypatch.setattr(grut, "resolve_grut", lambda cfg: (FakeAdapter(), tmp_path / "train.py"))
+    monkeypatch.setattr(
+        grut, "prepare_grut_dataset",
+        lambda cfg, m, **k: grut.GrutDataset(
+            root=tmp_path, images_dir=tmp_path, sparse_dir=tmp_path,
+            held_out_manifest=tmp_path / "h.json", test_split_interval=10,
+            masked_pixels_fraction=0.0,
+        ),
+    )
+    cfg = SceneConfig()
+    cfg.workspace_dir = tmp_path / "workspace"
+    cfg.reconstruction.splat_cleanup.enabled = False
+    manifest = SceneManifest.create(
+        scene_name="r", source_config=tmp_path / "s.yaml", build_mode="preview"
+    )
+    result = grut.export_environment_particlefield(cfg, manifest)
+
+    assert result.is_file()
+    assert any("export_usd" in str(a) for call in calls for a in call)
+    assert any("recovered by re-exporting" in w for w in manifest.warnings)

@@ -226,3 +226,21 @@ def test_visibility_filter_drops_unseen_gaussians():
     )
     assert info["removed_visibility"] == 1
     assert keep.tolist() == [True, False, True]
+
+
+def test_cleanup_refuses_to_gut_the_scene():
+    """A degenerate model must fail loudly, not silently produce an empty scene."""
+    from scan2usd.reconstruction.splat_cleanup import SplatCleanupParams
+
+    # 99% of Gaussians at zero opacity: the MCMC-decay failure mode.
+    n = 1000
+    pts = np.zeros((n, 3))
+    opac = np.concatenate([np.full(990, 0.0), np.full(10, 0.9)])
+    scales = np.full((n, 3), 0.01)
+    keep, info = compute_keep_mask(
+        pts, opac, scales, outlier_std=0.0, min_opacity=0.01,
+        observed_bounds=(np.array([-1.0]*3), np.array([1.0]*3)),
+    )
+    assert keep.sum() == 10  # the mask itself is correct
+    # The guard lives in the file-level path; check the params carry it.
+    assert SplatCleanupParams().min_keep_fraction == 0.05
