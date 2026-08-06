@@ -187,7 +187,7 @@ def get_quality() -> dict:
 
 
 @router.get("/preview.ply")
-def preview_ply():
+def preview_ply(small: bool = False):
     """
     Serve the browser-preview PLY, streamed so a 66 MB splat does not buffer.
 
@@ -200,7 +200,8 @@ def preview_ply():
         cfg = _cfg()
     except FileNotFoundError as exc:
         raise HTTPException(400, str(exc)) from exc
-    path = Path(cfg.workspace_dir) / "build" / "visual" / "preview.ply"
+    name = "preview_small.ply" if small else "preview.ply"
+    path = Path(cfg.workspace_dir) / "build" / "visual" / name
     if not path.is_file():
         raise HTTPException(
             404,
@@ -218,8 +219,11 @@ def preview_status() -> dict:
         raise HTTPException(400, str(exc)) from exc
     path = Path(cfg.workspace_dir) / "build" / "visual" / "preview.ply"
     source = Path(cfg.workspace_dir) / "build" / "visual" / "environment_splat.usd"
+    small = Path(cfg.workspace_dir) / "build" / "visual" / "preview_small.ply"
     exists = path.is_file()
     return {
+        "has_small": small.is_file(),
+        "small_bytes": small.stat().st_size if small.is_file() else 0,
         "exists": exists,
         "path": str(path),
         "bytes": path.stat().st_size if exists else 0,

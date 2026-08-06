@@ -3,6 +3,8 @@ import { client } from "../api/client";
 import { useProject } from "../state/ProjectContext";
 
 interface PreviewStatus {
+  has_small: boolean;
+  small_bytes: number;
   exists: boolean;
   path: string;
   bytes: number;
@@ -39,7 +41,7 @@ export function PreviewPage() {
 
   useEffect(() => () => disposer.current?.(), []);
 
-  const show = useCallback(async () => {
+  const show = useCallback(async (small = false) => {
     if (!container.current) return;
     setLoading(true);
     setProgress("loading viewer…");
@@ -50,8 +52,13 @@ export function PreviewPage() {
       const { createViewer, SplatLoader, SplatUtils } = aholo as unknown as {
         createViewer: (name: string, el: HTMLElement, cfg: object) => any;
         SplatLoader: {
-          parseSplatData: (type: number, input: Uint8Array) => Promise<unknown>;
+          parseSplatData: (
+            type: number,
+            input: Uint8Array,
+            packType?: number,
+          ) => Promise<unknown>;
           SplatFileType: Record<string, number>;
+          SplatPackType: Record<string, number>;
         };
         SplatUtils: { createSplat: (data: unknown) => Promise<unknown> };
       };
@@ -61,15 +68,36 @@ export function PreviewPage() {
       const viewer = createViewer("scan2usd-preview", container.current, {});
 
       setProgress("downloading splat…");
-      const response = await fetch("/api/quality/preview.ply");
+      const response = await fetch(`/api/quality/preview.ply${small ? "?small=true" : ""}`);
       if (!response.ok) throw new Error(await response.text());
       const buffer = new Uint8Array(await response.arrayBuffer());
 
-      setProgress("parsing…");
-      const data = await SplatLoader.parseSplatData(
-        SplatLoader.SplatFileType.PLY,
-        buffer,
-      );
+      setProgress(`parsing ${(buffer.length / 1048576).toFixed(0)} MB…`);
+      // The engine runs parsing in a module Worker built from a blob URL. When
+      // that worker fails to start, the returned promise never settles and the
+      // page sits on "parsing" forever with nothing in the console, so bound it
+      // and say so rather than hanging.
+      const data = await Promise.race([
+        SplatLoader.parseSplatData(
+          SplatLoader.SplatFileType.PLY,
+          buffer,
+          SplatLoader.SplatPackType?.Raw,
+        ),
+        new Promise((_, reject) =>
+          setTimeout(
+            () =>
+              reject(
+                new Error(
+                  "Parsing did not finish in 120s. The splat worker most likely " +
+                    "failed to start — check the browser console for a Worker or " +
+                    "SecurityError. A smaller preview (Max Gaussians in the export " +
+                    "tool) will confirm whether it is size-related.",
+                ),
+              ),
+            120000,
+          ),
+        ),
+      ]);
       const splat = await SplatUtils.createSplat(data);
       viewer.getScene().add(splat);
       disposer.current = () => {
@@ -107,9 +135,17 @@ export function PreviewPage() {
         <button
           className="rounded border border-ink-700 px-3 py-1.5 hover:bg-ink-800 disabled:opacity-50"
           disabled={!status?.exists || loading}
-          onClick={() => void show()}
+          onClick={() => void show(false)}
         >
           {loading ? progress || "loading…" : "Show scene"}
+        </button>
+        <button
+          className="rounded border border-ink-700 px-3 py-1.5 hover:bg-ink-800 disabled:opacity-50"
+          disabled={!status?.has_small || loading}
+          title="50k Gaussians — if this renders and the full one does not, the problem is size, not the file."
+          onClick={() => void show(true)}
+        >
+          Show small (50k)
         </button>
         <button
           className="rounded border border-ink-700 px-3 py-1.5 hover:bg-ink-800"
