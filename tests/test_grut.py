@@ -303,3 +303,61 @@ def test_export_recovers_from_checkpoint_when_inline_export_ooms(tmp_path, monke
     assert result.is_file()
     assert any("export_usd" in str(a) for call in calls for a in call)
     assert any("recovered by re-exporting" in w for w in manifest.warnings)
+
+
+def test_pruning_ends_where_densification_ends(tmp_path):
+    """
+    The bug that left 65% of the bedroom's Gaussians dead.
+
+    3DGRUT ends pruning at a hardcoded 15000 while opacity resets follow
+    densification, so stretching only densification lets resets kill Gaussians
+    for thousands of iterations after the last prune that could clear them.
+    """
+    from scan2usd.reconstruction.grut import consistent_strategy_overrides
+
+    overrides = dict(o.split("=", 1) for o in consistent_strategy_overrides(50000, 0.5))
+    assert overrides["strategy.densify.end_iteration"] == "25000"
+    assert (
+        overrides["strategy.prune.end_iteration"]
+        == overrides["strategy.densify.end_iteration"]
+    )
+    assert overrides["scheduler.positions.max_steps"] == "50000"
+
+
+def test_user_overrides_win_over_generated_ones(tmp_path):
+    cfg = _scene(tmp_path)
+    cfg.reconstruction.grut_max_iterations = 50000
+    cfg.reconstruction.grut_overrides = ["strategy.prune.end_iteration=9000"]
+    manifest = SceneManifest.create(
+        scene_name="room", source_config=tmp_path / "s.yaml", build_mode="preview"
+    )
+    args = grut_train_args(
+        cfg,
+        prepare_grut_dataset(cfg, manifest),
+        output_dir=tmp_path / "o",
+        output_usd=tmp_path / "o" / "s.usd",
+    )
+    assert "strategy.prune.end_iteration=9000" in args
+    assert "strategy.prune.end_iteration=25000" not in args
+    # The rest of the generated schedule still applies.
+    assert "strategy.densify.end_iteration=25000" in args
+
+
+def test_anti_fog_is_off_until_asked_for(tmp_path):
+    cfg = _scene(tmp_path)
+    manifest = SceneManifest.create(
+        scene_name="room", source_config=tmp_path / "s.yaml", build_mode="preview"
+    )
+    dataset = prepare_grut_dataset(cfg, manifest)
+    args = grut_train_args(cfg, dataset, output_dir=tmp_path / "o", output_usd=tmp_path / "o" / "s.usd")
+    assert not any("lambda_opacity" in a for a in args)
+
+    cfg.reconstruction.anti_fog.enabled = True
+    cfg.reconstruction.anti_fog.prune_weight_threshold = 0.5
+    cfg.reconstruction.grut_max_iterations = 50000
+    args = grut_train_args(cfg, dataset, output_dir=tmp_path / "o", output_usd=tmp_path / "o" / "s.usd")
+    assert "loss.use_opacity=true" in args
+    assert "loss.lambda_opacity=0.01" in args
+    # Weight pruning must not outlive densification, or it hollows the model out.
+    assert "strategy.prune_weight.end_iteration=25000" in args
+    assert "strategy.prune_weight.start_iteration=10000" in args

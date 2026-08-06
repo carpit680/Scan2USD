@@ -707,6 +707,123 @@ CONFIG_PARAMS: list[dict[str, Any]] = [
         help_level="essential",
     ),
     _p(
+        id="reconstruction.grut_schedule_autofix",
+        label="Keep training schedule consistent",
+        type="bool",
+        group="reconstruction",
+        default=True,
+        config_path="reconstruction.grut_schedule_autofix",
+        tooltip=(
+            "Derive densify/prune/scheduler end-iterations from the iteration count "
+            "so they end together. 3DGRUT ends pruning at a hardcoded 15000 while "
+            "opacity resets follow densification, so stretching only densification "
+            "leaves resets killing Gaussians long after the last prune that could "
+            "clear them — the bedroom's 50k run ended with 65% of its Gaussians "
+            "below opacity 0.01. Anything you set in grut_overrides still wins."
+        ),
+        help_level="essential",
+    ),
+    _p(
+        id="reconstruction.densify_end_fraction",
+        label="Densify until (fraction of run)",
+        type="float",
+        group="reconstruction",
+        default=0.5,
+        config_path="reconstruction.densify_end_fraction",
+        min=0.1,
+        max=0.9,
+        step=0.05,
+        tooltip="Densification, pruning and opacity resets all stop at this fraction of the run.",
+        widget="slider",
+    ),
+    _p(
+        id="reconstruction.anti_fog.enabled",
+        label="Anti-fog training",
+        type="bool",
+        group="reconstruction",
+        default=False,
+        config_path="reconstruction.anti_fog.enabled",
+        tooltip=(
+            "Push back on haze during training, where the optimiser can still "
+            "replace a faint sheet with a solid primitive. Photometric loss alone "
+            "cannot: once a floater's blended colour matches the background its "
+            "opacity gradient vanishes. Cleanup afterwards has a hard ceiling — on "
+            "the bedroom the safe filters reached 13.4% transmittance and stopped."
+        ),
+        help_level="essential",
+    ),
+    _p(
+        id="reconstruction.anti_fog.lambda_opacity",
+        label="Opacity penalty",
+        type="float",
+        group="reconstruction",
+        default=0.01,
+        config_path="reconstruction.anti_fog.lambda_opacity",
+        min=0.0,
+        max=0.2,
+        step=0.005,
+        tooltip=(
+            "Weight on total opacity: a Gaussian must earn the light it blocks. Too "
+            "high eats translucent detail (curtains, lampshades), so start low."
+        ),
+    ),
+    _p(
+        id="reconstruction.anti_fog.lambda_scale",
+        label="Scale penalty",
+        type="float",
+        group="reconstruction",
+        default=0.0,
+        config_path="reconstruction.anti_fog.lambda_scale",
+        min=0.0,
+        max=0.2,
+        step=0.005,
+        tooltip="Weight on Gaussian size. 0 disables.",
+        help_level="advanced",
+    ),
+    _p(
+        id="reconstruction.anti_fog.prune_weight_threshold",
+        label="Prune by render contribution",
+        type="float",
+        group="reconstruction",
+        default=0.0,
+        config_path="reconstruction.anti_fog.prune_weight_threshold",
+        min=0.0,
+        max=1.0,
+        step=0.05,
+        tooltip=(
+            "Drop Gaussians whose accumulated contribution to rendered pixels stays "
+            "below this. NO EFFECT on the pinned 3DGRUT: the prune it would trigger "
+            "is defined but never called, and the counter it reads does not exist. "
+            "Kept for a future version that implements it. 0 disables."
+        ),
+    ),
+    _p(
+        id="reconstruction.anti_fog.prune_weight_frequency",
+        label="Contribution prune interval",
+        type="int",
+        group="reconstruction",
+        default=100,
+        config_path="reconstruction.anti_fog.prune_weight_frequency",
+        min=10,
+        max=1000,
+        step=10,
+        tooltip="Iterations between contribution-based prunes.",
+        help_level="advanced",
+    ),
+    _p(
+        id="reconstruction.anti_fog.prune_weight_start_fraction",
+        label="Contribution prune start",
+        type="float",
+        group="reconstruction",
+        default=0.2,
+        config_path="reconstruction.anti_fog.prune_weight_start_fraction",
+        min=0.0,
+        max=0.9,
+        step=0.05,
+        tooltip="When to start, as a fraction of the run. It always ends with densification.",
+        help_level="advanced",
+    ),
+    _p(
         id="reconstruction.grut_max_iterations",
         label="3DGRUT max iterations",
         type="int",

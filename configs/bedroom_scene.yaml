@@ -36,8 +36,6 @@ reconstruction:
   held_out_ratio: 0.1
   preview_allow_unobserved_background: false
   grut_overrides:
-  - scheduler.positions.max_steps=50000
-  - strategy.densify.end_iteration=25000
   - loss.lambda_ssim=0.25
   - model.progressive_training.increase_frequency=500
   usd_splat_format: standard
@@ -55,6 +53,14 @@ reconstruction:
     air_min_neighbors: 0
     air_neighbor_radius_frac: 0.01
     free_behind: true
+  grut_schedule_autofix: true
+  densify_end_fraction: 0.5
+  anti_fog:
+    enabled: true
+    lambda_opacity: 0.01
+    prune_weight_threshold: 0.0
+    prune_weight_frequency: 100
+    prune_weight_start_fraction: 0.2
 segmentation:
   proposal_model: yolov8s-worldv2.pt
   mask_model: sam2

@@ -8,6 +8,7 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from PIL import Image
@@ -353,6 +354,82 @@ def resolve_grut(cfg: SceneConfig) -> tuple[ExternalToolAdapter, Path]:
     return ExternalToolAdapter("3dgrut", python, cwd=root, env=env), train
 
 
+def consistent_strategy_overrides(iterations: int, densify_end_fraction: float) -> list[str]:
+    """
+    Keep densification, pruning and opacity resets on the same schedule.
+
+    3DGRUT's defaults end densification at 15000 and pruning at 15000, while
+    ``reset_density.end_iteration`` interpolates from ``densify.end_iteration``.
+    Stretching only densification — which is what an override like
+    ``strategy.densify.end_iteration=25000`` does — leaves opacity resets running
+    for 10k iterations after the last prune that could clear what they killed.
+
+    The bedroom's 50k run ended with 65.2% of its 2.9M Gaussians below opacity
+    0.01: nearly two million dead primitives costing VRAM and iteration time, and
+    exactly the faint-sheet population that reads as haze. Pruning now ends where
+    densification does.
+    """
+    end = max(1, int(round(iterations * float(densify_end_fraction))))
+    return [
+        f"strategy.densify.end_iteration={end}",
+        f"strategy.prune.end_iteration={end}",
+        f"scheduler.positions.max_steps={iterations}",
+    ]
+
+
+def anti_fog_overrides(anti_fog: Any, iterations: int, densify_end: int) -> list[str]:
+    """
+    Train-time pressure against haze, using knobs 3DGRUT already ships.
+
+    Photometric loss alone provably cannot remove a floater: once its blended
+    colour reaches equilibrium with the background its opacity gradient vanishes,
+    so it is never pushed toward transparent. Cleanup then inherits the problem,
+    and post-hoc filtering has a hard ceiling — on the bedroom the safe rules got
+    transmittance from 6.7% to 13.4% and then ran out, because what remains is
+    genuinely carrying low-texture surfaces and cannot be cut without them.
+
+    Both levers below act while the optimiser can still respond, replacing a
+    faint sheet with a solid primitive rather than merely losing it:
+
+    - ``loss.lambda_opacity`` penalises total opacity, so a Gaussian must earn
+      the light it blocks.
+    - ``strategy.prune_weight`` would drop Gaussians whose accumulated render
+      contribution stays low — the accumulated-evidence pruning the floater
+      literature converges on. It is **inert in the pinned 3DGRUT**:
+      ``prune_gaussians_weight()`` exists but is never called, and the
+      ``model.rolling_weight_contrib`` it reads is defined nowhere in the tree.
+      The keys are still emitted so a version that implements it picks them up,
+      but do not expect them to do anything today.
+    """
+    if not getattr(anti_fog, "enabled", False):
+        return []
+    overrides = [
+        "loss.use_opacity=true",
+        f"loss.lambda_opacity={anti_fog.lambda_opacity}",
+    ]
+    if anti_fog.lambda_scale > 0:
+        overrides += ["loss.use_scale=true", f"loss.lambda_scale={anti_fog.lambda_scale}"]
+    if anti_fog.prune_weight_threshold > 0:
+        start = max(1, int(round(iterations * anti_fog.prune_weight_start_fraction)))
+        overrides += [
+            f"strategy.prune_weight.frequency={anti_fog.prune_weight_frequency}",
+            f"strategy.prune_weight.start_iteration={start}",
+            # Never past the last densification: pruning with nothing left to
+            # replace what it removes is how the MCMC runs hollowed themselves out.
+            f"strategy.prune_weight.end_iteration={densify_end}",
+            f"strategy.prune_weight.weight_threshold={anti_fog.prune_weight_threshold}",
+        ]
+    return overrides
+
+
+def _merge_overrides(generated: list[str], user: list[str]) -> list[str]:
+    """User-supplied Hydra overrides win over anything generated."""
+    claimed = {str(item).split("=", 1)[0].strip() for item in user if str(item).strip()}
+    merged = [item for item in generated if item.split("=", 1)[0] not in claimed]
+    merged += [str(item).strip() for item in user if str(item).strip()]
+    return merged
+
+
 def grut_train_args(
     cfg: SceneConfig,
     dataset: GrutDataset,
@@ -382,10 +459,17 @@ def grut_train_args(
         "export_usd.apply_normalizing_transform=false",
         "export_usd.sorting_mode_hint=rayHitDistance",
     ]
-    for override in cfg.reconstruction.grut_overrides:
-        text = str(override).strip()
-        if text:
-            args.append(text)
+    iterations = int(cfg.reconstruction.grut_max_iterations)
+    generated: list[str] = []
+    if cfg.reconstruction.grut_schedule_autofix:
+        generated += consistent_strategy_overrides(
+            iterations, cfg.reconstruction.densify_end_fraction
+        )
+    densify_end = max(
+        1, int(round(iterations * float(cfg.reconstruction.densify_end_fraction)))
+    )
+    generated += anti_fog_overrides(cfg.reconstruction.anti_fog, iterations, densify_end)
+    args.extend(_merge_overrides(generated, list(cfg.reconstruction.grut_overrides)))
     return args
 
 

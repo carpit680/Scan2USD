@@ -326,6 +326,48 @@ class SplatCleanupConfig:
 
 
 @dataclass
+class AntiFogConfig:
+    """
+    Train-time pressure against haze, using knobs 3DGRUT already ships.
+
+    Photometric loss alone cannot remove a floater: once its blended colour
+    reaches equilibrium with the background, its opacity gradient vanishes and
+    nothing pushes it toward transparent. Post-hoc filtering then inherits a
+    problem it cannot finish -- on the bedroom the safe rules lifted
+    transmittance from 6.7% to 13.4% and stopped, because what remains really is
+    carrying low-texture surfaces. These act while the optimiser can still
+    replace a faint sheet with a solid primitive.
+    """
+
+    enabled: bool = False
+    # L1 on total opacity: a Gaussian must earn the light it blocks. 0.01 is a
+    # starting point; the tuner sweeps it.
+    lambda_opacity: float = 0.01
+    lambda_scale: float = 0.0
+    # Accumulated-evidence pruning: drop Gaussians whose rolling render
+    # contribution stays below this. INERT in the pinned 3DGRUT: its
+    # prune_gaussians_weight() is defined but never called, and the
+    # model.rolling_weight_contrib it reads is defined nowhere in the tree, so
+    # these keys are accepted by Hydra and then ignored. Kept for a future
+    # version that implements it. 0 disables.
+    prune_weight_threshold: float = 0.0
+    prune_weight_frequency: int = 100
+    prune_weight_start_fraction: float = 0.2
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> AntiFogConfig:
+        raw = data or {}
+        return cls(
+            enabled=bool(raw.get("enabled", False)),
+            lambda_opacity=float(raw.get("lambda_opacity", 0.01)),
+            lambda_scale=float(raw.get("lambda_scale", 0.0)),
+            prune_weight_threshold=float(raw.get("prune_weight_threshold", 0.0)),
+            prune_weight_frequency=int(raw.get("prune_weight_frequency", 100)),
+            prune_weight_start_fraction=float(raw.get("prune_weight_start_fraction", 0.2)),
+        )
+
+
+@dataclass
 class ReconstructionConfig:
     """Visual and geometric reconstruction backend selection."""
 
@@ -369,6 +411,14 @@ class ReconstructionConfig:
     splat_cleanup: SplatCleanupConfig = field(default_factory=SplatCleanupConfig)
     # Extra Hydra ``key=value`` overrides appended to 3DGRUT train.py (quality knobs).
     grut_overrides: list[str] = field(default_factory=list)
+    # Keep densification, pruning and opacity resets on one schedule. 3DGRUT ends
+    # pruning at a hardcoded 15000 while opacity resets follow densification, so
+    # stretching only densification leaves resets killing Gaussians long after the
+    # last prune that could clear them: the bedroom's 50k run ended with 65.2% of
+    # its Gaussians below opacity 0.01.
+    grut_schedule_autofix: bool = True
+    densify_end_fraction: float = 0.5
+    anti_fog: AntiFogConfig = field(default_factory=AntiFogConfig)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> ReconstructionConfig:
@@ -396,6 +446,9 @@ class ReconstructionConfig:
             frame_max_dim=int(raw.get("frame_max_dim", 0)),
             splat_cleanup=SplatCleanupConfig.from_dict(raw.get("splat_cleanup")),
             grut_overrides=overrides,
+            grut_schedule_autofix=bool(raw.get("grut_schedule_autofix", True)),
+            densify_end_fraction=float(raw.get("densify_end_fraction", 0.5)),
+            anti_fog=AntiFogConfig.from_dict(raw.get("anti_fog")),
         )
 
 
