@@ -29,13 +29,30 @@ from scan2usd.config import SceneConfig
 from scan2usd.eval.scene_quality import build_scene_quality_report
 from scan2usd.tuning.store import TrialRecord, TrialStore
 
+# Everything below 8.0 is measured damage: on the kitchen 50k model outlier_std
+# 4.0 cut 56% of the Gaussians and tore holes in floors and walls, scoring 66.7
+# against 74.1 at 8.0. The old default swept 2.0-6.0, i.e. only values the
+# project had already shown to be harmful.
 DEFAULT_CHEAP_SPACE: dict[str, list[Any]] = {
-    "outlier_std": [2.0, 3.0, 4.0, 6.0],
-    "min_opacity": [0.005, 0.01, 0.05],
+    "outlier_std": [6.0, 8.0],
+    "min_opacity": [0.005, 0.01],
+    "free_space_votes": [0, 3, 10],
+    "crop_margin": [0.25, 0.5],
 }
 DEFAULT_RETRAIN_SPACE: dict[str, list[Any]] = {
     "grut_max_iterations": [30000, 50000],
     "densify_end_fraction": [0.3, 0.5],
+}
+# Trials whose parameters are known to destroy a scene are refused before the
+# GPU time is spent: lambda_opacity 0.01 collapsed the bedroom from 2.9M
+# Gaussians to 8,576 while reporting a healthy loss throughout.
+UNSAFE_RETRAIN: dict[str, tuple[float, str]] = {
+    "lambda_opacity": (
+        0.005,
+        "collapsed the bedroom to 8,576 Gaussians from 2.9M — it drives "
+        "opacities under the density-prune threshold as fast as densification "
+        "creates them",
+    ),
 }
 
 
@@ -47,15 +64,37 @@ def grid(space: dict[str, list[Any]]) -> Iterator[dict[str, Any]]:
 
 
 def apply_cheap_params(cfg: SceneConfig, params: dict[str, Any]) -> None:
+    """
+    Apply any SplatCleanupConfig field named in a trial.
+
+    Previously only outlier_std, min_opacity and max_scale were honoured, and
+    anything else was silently ignored — so the bedroom config listed
+    crop_margin and max_scale_frac in its tuning space and the tuner quietly
+    swept neither, reporting identical scores as if the parameter did not
+    matter. Unknown names now raise rather than disappear.
+    """
+    import dataclasses
+
     cleanup = cfg.reconstruction.splat_cleanup
     cleanup.enabled = True
-    if "outlier_std" in params:
-        cleanup.outlier_std = float(params["outlier_std"])
-    if "min_opacity" in params:
-        cleanup.min_opacity = float(params["min_opacity"])
-    if "max_scale" in params:
-        value = params["max_scale"]
-        cleanup.max_scale = None if value is None else float(value)
+    known = {f.name: f for f in dataclasses.fields(cleanup)}
+    for name, value in params.items():
+        field = known.get(name)
+        if field is None:
+            raise KeyError(
+                f"{name!r} is not a splat_cleanup parameter. Available: "
+                + ", ".join(sorted(known))
+            )
+        if value is None:
+            setattr(cleanup, name, None)
+            continue
+        annotation = str(field.type)
+        if "bool" in annotation:
+            setattr(cleanup, name, bool(value))
+        elif "int" in annotation and "float" not in annotation:
+            setattr(cleanup, name, int(value))
+        else:
+            setattr(cleanup, name, float(value))
 
 
 def apply_retrain_params(cfg: SceneConfig, params: dict[str, Any]) -> None:
@@ -97,6 +136,7 @@ class SceneTuner:
         render_fn: Callable[[SceneConfig, Path], None] | None = None,
         retrain_fn: Callable[[SceneConfig], None] | None = None,
         compute_lpips: bool = True,
+        fog_weight: float = 1.0,
         log: Callable[[str], None] = print,
     ) -> None:
         self.cfg = cfg
@@ -104,6 +144,7 @@ class SceneTuner:
         self.tuning_root = cfg.workspace_dir / "tuning"
         self.store = TrialStore(self.tuning_root / "trials.json")
         self.compute_lpips = compute_lpips
+        self.fog_weight = float(fog_weight)
         self.log = log
         self._clean = clean_fn or self._default_clean
         self._package = package_fn or self._default_package
@@ -185,16 +226,49 @@ class SceneTuner:
             compute_lpips=self.compute_lpips,
             output_path=Path(trial.artifacts_dir or self.tuning_root) / "scene_quality.json",
         )
-        trial.quality_score = report["quality_score"]
+        score = report["quality_score"]
+        fog = self._fog_metrics()
+        # Held-out appearance is structurally blind to interior haze: it renders
+        # roughly the pixels the surface behind it would. Without this term the
+        # tuner cannot tell a clear room from a foggy one, and will happily pick
+        # the foggy one for a hundredth of a dB.
+        transmittance = (fog or {}).get("transmittance_across_room")
+        penalty = 0.0
+        if score is not None and transmittance is not None:
+            penalty = self.fog_weight * (1.0 - float(transmittance)) * 30.0
+            score = score - penalty
+        trial.quality_score = score
         trial.metrics = {
             "mean_psnr": report["photorealism"]["mean_psnr"],
             "mean_ssim": report["photorealism"]["mean_ssim"],
             "mean_lpips": report["photorealism"]["mean_lpips"],
             "evaluated_views": report["photorealism"]["evaluated_views"],
             "gaussian_count": report["cleanliness"].get("gaussian_count"),
+            "appearance_score": report["quality_score"],
+            "transmittance_across_room": transmittance,
+            "fog_penalty": round(penalty, 3),
         }
 
-    def run_cheap_trial(self, params: dict[str, Any]) -> TrialRecord:
+    def _fog_metrics(self) -> dict[str, Any] | None:
+        """Fog from the cleanup report this trial just wrote — no extra work."""
+        import json as _json
+
+        path = (
+            Path(self.cfg.workspace_dir)
+            / "build"
+            / "visual"
+            / "splat_cleanup_report.json"
+        )
+        try:
+            if path.is_file():
+                return _json.loads(path.read_text(encoding="utf-8")).get("fog_metrics")
+        except (OSError, ValueError):
+            return None
+        return None
+
+    def run_cheap_trial(
+        self, params: dict[str, Any], *, parent_trial_id: str | None = None
+    ) -> TrialRecord:
         trial_id = self.store.next_trial_id("cheap")
         trial_dir = self.tuning_root / "trials" / trial_id
         render_dir = trial_dir / "renders"
@@ -204,6 +278,7 @@ class SceneTuner:
             params=dict(params),
             render_dir=str(render_dir),
             artifacts_dir=str(trial_dir),
+            parent_trial_id=parent_trial_id,
         )
         self.store.upsert(trial)
         self.log(f"[tune] {trial_id}: {params}")
@@ -226,7 +301,13 @@ class SceneTuner:
             self.store.upsert(trial)
         return trial
 
-    def run_cheap_loop(self, space: dict[str, list[Any]], max_trials: int) -> None:
+    def run_cheap_loop(
+        self,
+        space: dict[str, list[Any]],
+        max_trials: int,
+        *,
+        parent_trial_id: str | None = None,
+    ) -> None:
         done = self.store.scored_params("cheap")
         for params in grid(space):
             if sum(1 for t in self.store.trials if t.kind == "cheap" and t.status == "scored") >= max_trials:
@@ -234,7 +315,7 @@ class SceneTuner:
                 return
             if params in done:
                 continue
-            self.run_cheap_trial(params)
+            self.run_cheap_trial(params, parent_trial_id=parent_trial_id)
 
     def run_retrain_trial(
         self,
@@ -263,9 +344,17 @@ class SceneTuner:
                 source = visual / name
                 if source.is_file():
                     shutil.copy2(source, trial_dir / name)
-            self.run_cheap_loop(cheap_space, cheap_budget)
-            best = self.store.best()
-            trial.quality_score = best.quality_score if best else None
+            self.run_cheap_loop(cheap_space, cheap_budget, parent_trial_id=trial_id)
+            # This retrain's own best cleanup, not the best trial ever run.
+            children = [
+                t
+                for t in self.store.trials
+                if t.parent_trial_id == trial_id and t.quality_score is not None
+            ]
+            trial.quality_score = (
+                max(t.quality_score for t in children) if children else None
+            )
+            trial.metrics = {"cheap_children": len(children)}
             trial.status = "scored"
         except Exception as exc:  # noqa: BLE001
             trial.status = "failed"
@@ -315,13 +404,24 @@ def run_tuning(
     cheap_space: dict[str, list[Any]] | None = None,
     retrain_space: dict[str, list[Any]] | None = None,
     compute_lpips: bool = True,
+    fog_weight: float = 1.0,
     promote: bool = True,
     log: Callable[[str], None] = print,
     tuner: SceneTuner | None = None,
 ) -> dict[str, Any]:
     """Full tuning session; returns a summary dict."""
-    tuner = tuner or SceneTuner(cfg, config_path, compute_lpips=compute_lpips, log=log)
+    tuner = tuner or SceneTuner(
+        cfg, config_path, compute_lpips=compute_lpips, fog_weight=fog_weight, log=log
+    )
     cheap = cheap_space or DEFAULT_CHEAP_SPACE
+    for space in (cheap, retrain_space or DEFAULT_RETRAIN_SPACE):
+        for name, (limit, why) in UNSAFE_RETRAIN.items():
+            values = [v for v in space.get(name, []) if v is not None and float(v) > limit]
+            if values:
+                raise ValueError(
+                    f"tuning space has {name}={values}, above the safe limit "
+                    f"{limit}: {why}. Refusing to spend GPU time on it."
+                )
     tuner.run_cheap_loop(cheap, max_cheap_trials)
     if max_retrain_trials > 0:
         done_retrain = tuner.store.scored_params("retrain")

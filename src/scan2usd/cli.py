@@ -1167,6 +1167,7 @@ def tune(
         cheap_space=cfg.tuning.cheap_params or None,
         retrain_space=cfg.tuning.retrain_params or None,
         compute_lpips=lpips if lpips is not None else cfg.tuning.lpips,
+        fog_weight=cfg.tuning.fog_weight,
         promote=promote,
         log=typer.echo,
     )

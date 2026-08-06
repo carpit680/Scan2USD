@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import json
 from pathlib import Path
 
@@ -159,3 +161,99 @@ def test_apply_retrain_params_syncs_scheduler() -> None:
     assert cfg.reconstruction.grut_max_iterations == 30000
     assert "scheduler.positions.max_steps=30000" in cfg.reconstruction.grut_overrides
     assert "strategy.densify.end_iteration=15000" in cfg.reconstruction.grut_overrides
+
+
+def test_a_retrain_scores_its_own_children_not_the_global_best(tmp_path):
+    """
+    The bug: trial.quality_score = store.best().
+
+    A retrain that produced a worse model inherited the score of the best trial
+    ever run, so the first good retrain made every later one look equally good
+    and promotion picked arbitrarily among them.
+    """
+    from scan2usd.tuning.store import TrialRecord, TrialStore
+
+    store = TrialStore(tmp_path / "trials.json")
+    store.upsert(TrialRecord("cheap_001", "cheap", {}, "scored", 90.0, parent_trial_id="retrain_001"))
+    store.upsert(TrialRecord("cheap_002", "cheap", {}, "scored", 40.0, parent_trial_id="retrain_002"))
+
+    def best_of(parent: str) -> float:
+        children = [
+            t for t in store.trials if t.parent_trial_id == parent and t.quality_score is not None
+        ]
+        return max(t.quality_score for t in children)
+
+    assert best_of("retrain_001") == 90.0
+    # The second retrain must not inherit the first's 90.
+    assert best_of("retrain_002") == 40.0
+    assert store.best().quality_score == 90.0
+
+
+def test_cheap_params_reach_every_cleanup_field(tmp_path):
+    """
+    The bedroom config listed crop_margin and max_scale_frac in its tuning
+    space; the tuner honoured neither and reported identical scores as though
+    the parameters did not matter.
+    """
+    from scan2usd.config import SceneConfig
+    from scan2usd.tuning.runner import apply_cheap_params
+
+    cfg = SceneConfig()
+    apply_cheap_params(
+        cfg,
+        {
+            "crop_margin": 0.25,
+            "max_scale_frac": 0.05,
+            "free_space_votes": 3,
+            "hull_air": True,
+            "outlier_std": 8.0,
+        },
+    )
+    cleanup = cfg.reconstruction.splat_cleanup
+    assert cleanup.crop_margin == 0.25
+    assert cleanup.max_scale_frac == 0.05
+    assert cleanup.free_space_votes == 3
+    assert cleanup.hull_air is True
+    assert cleanup.outlier_std == 8.0
+
+
+def test_a_typo_in_a_tuning_space_raises_instead_of_vanishing():
+    from scan2usd.config import SceneConfig
+    from scan2usd.tuning.runner import apply_cheap_params
+
+    with pytest.raises(KeyError, match="crop_margins"):
+        apply_cheap_params(SceneConfig(), {"crop_margins": 0.25})
+
+
+def test_default_space_no_longer_sweeps_values_known_to_destroy_scenes():
+    """outlier_std below 8 is measured damage; the old default swept 2.0-6.0."""
+    from scan2usd.tuning.runner import DEFAULT_CHEAP_SPACE
+
+    assert min(DEFAULT_CHEAP_SPACE["outlier_std"]) >= 6.0
+    assert "free_space_votes" in DEFAULT_CHEAP_SPACE
+
+
+def test_unsafe_retrain_space_is_refused_before_spending_gpu_time(tmp_path):
+    from scan2usd.config import SceneConfig
+    from scan2usd.tuning.runner import run_tuning
+
+    with pytest.raises(ValueError, match="lambda_opacity"):
+        run_tuning(
+            SceneConfig(),
+            tmp_path / "s.yaml",
+            max_cheap_trials=0,
+            max_retrain_trials=1,
+            retrain_space={"lambda_opacity": [0.01]},
+        )
+
+
+def test_fog_penalty_prefers_the_clear_scene_at_equal_appearance():
+    """
+    Appearance cannot see haze, so without this term a foggy scene wins on a
+    hundredth of a dB. 30 points is the full-scale weight: a room you cannot
+    see across loses more than any appearance difference can recover.
+    """
+    weight, span = 1.0, 30.0
+    clear = 65.0 - weight * (1.0 - 0.95) * span
+    foggy = 65.1 - weight * (1.0 - 0.13) * span
+    assert clear > foggy

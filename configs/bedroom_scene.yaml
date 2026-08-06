@@ -30,7 +30,7 @@ reconstruction:
   blur_threshold: 0
   min_frame_features: 300
   frame_max_dim: 0
-  grut_downscale: 2
+  grut_downscale: 1
   grut_config: apps/colmap_3dgut.yaml
   grut_max_iterations: 50000
   held_out_ratio: 0.1
@@ -112,13 +112,17 @@ tuning:
   max_retrain_trials: 0
   lpips: true
   cheap_params:
+    outlier_std:
+    - 6.0
+    - 8.0
+    free_space_votes:
+    - 0
+    - 3
+    - 10
     crop_margin:
     - 0.25
     - 0.5
-    - 1
-    max_scale_frac:
-    - 0.05
-    - 0.08
+  fog_weight: 1.0
 external:
   colmap: /home/arpit/Scan2USD/workspace/colmap-cuda/bin/colmap
   ns_process_data: ns-process-data

@@ -25,6 +25,10 @@ class TrialRecord:
     metrics: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
     render_dir: str | None = None
+    # Which retrain spawned this cheap trial. Without it a retrain scored
+    # `store.best()` — the best trial ever run, not its own result — so the
+    # first good retrain made every later one look equally good.
+    parent_trial_id: str | None = None
     artifacts_dir: str | None = None
     started_at: str = field(default_factory=_utc_now)
     finished_at: str | None = None

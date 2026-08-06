@@ -1694,6 +1694,24 @@ CONFIG_PARAMS: list[dict[str, Any]] = [
     ),
     # tuning
     _p(
+        id="tuning.fog_weight",
+        label="Fog weight in tuning",
+        type="float",
+        group="tuning",
+        default=1.0,
+        config_path="tuning.fog_weight",
+        min=0.0,
+        max=3.0,
+        step=0.1,
+        tooltip=(
+            "How hard to weight interior haze against appearance when ranking "
+            "trials. Held-out metrics cannot see haze — it renders roughly the "
+            "pixels the surface behind it would — so at 0 the tuner will pick a "
+            "foggy scene over a clear one for a hundredth of a dB."
+        ),
+        help_level="essential",
+    ),
+    _p(
         id="tuning.max_cheap_trials",
         label="Cheap trial budget",
         type="int",

@@ -598,6 +598,10 @@ class TuningConfig:
     # Retrain trials re-run 3DGRUT training (hours each on GPU); opt-in.
     max_retrain_trials: int = 0
     lpips: bool = True
+    # How hard to weight interior haze against appearance. Held-out metrics
+    # cannot see haze at all, so without this the tuner picks a foggy scene over
+    # a clear one for a hundredth of a dB. 0 disables.
+    fog_weight: float = 1.0
     # Optional {param: [values, …]} overrides of the built-in search spaces.
     cheap_params: dict[str, list[Any]] = field(default_factory=dict)
     retrain_params: dict[str, list[Any]] = field(default_factory=dict)
@@ -609,6 +613,7 @@ class TuningConfig:
             max_cheap_trials=int(raw.get("max_cheap_trials", 12)),
             max_retrain_trials=int(raw.get("max_retrain_trials", 0)),
             lpips=bool(raw.get("lpips", True)),
+            fog_weight=float(raw.get("fog_weight", 1.0)),
             cheap_params={
                 str(k): list(v) for k, v in dict(raw.get("cheap_params") or {}).items()
             },
