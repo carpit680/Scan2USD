@@ -53,6 +53,7 @@ reconstruction:
     air_min_neighbors: 0
     air_neighbor_radius_frac: 0.01
     free_behind: true
+    hull_air: true
   grut_schedule_autofix: true
   densify_end_fraction: 0.5
   anti_fog:

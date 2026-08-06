@@ -395,6 +395,7 @@ def free_space_removal_mask(
     air_min_neighbors: int = 0,
     air_neighbor_radius_frac: float = 0.01,
     free_behind: bool = False,
+    hull_air: bool = False,
 ) -> tuple[np.ndarray, dict]:
     """
     Mask of Gaussians to delete: in the air, by two independent kinds of evidence.
@@ -446,6 +447,19 @@ def free_space_removal_mask(
         behind_removed = int(np.count_nonzero(occluded_free & ~remove))
         remove |= occluded_free
 
+    hull_removed = 0
+    if hull_air:
+        # Everything in the walked volume with no surface near it, whether or not
+        # a ray proved its cell empty. Walls cannot be caught by this: the hull is
+        # the convex hull of the camera positions, and in an inside-out room
+        # capture every wall is outside it. What is at risk is furniture the
+        # tracker covered poorly, so this is measured against held-out PSNR
+        # rather than assumed safe.
+        inside = inside_camera_hull(positions, carve.centres) & in_grid
+        hull_only = inside & ~near_surface
+        hull_removed = int(np.count_nonzero(hull_only & ~remove))
+        remove |= hull_only
+
     sparse_removed = 0
     if int(air_min_neighbors) > 0:
         counts = _neighbor_counts(positions, float(air_neighbor_radius_frac) * span)
@@ -458,6 +472,7 @@ def free_space_removal_mask(
         "removed_carved": int(np.count_nonzero(carved)),
         "removed_sparse_air": sparse_removed,
         "removed_free_behind": behind_removed,
+        "removed_hull_air": hull_removed,
         # Zero by construction -- the rules exclude near-surface Gaussians. Kept
         # in the report so a future change that breaks that shows up immediately.
         "free_space_surface_loss": int(np.count_nonzero(remove & near_surface)),

@@ -76,6 +76,10 @@ class SplatCleanupParams:
     # Also remove Gaussians the cameras saw straight past. Safe where the
     # density rule is not: anything that occludes is left alone.
     free_behind: bool = False
+    # Remove all non-surface Gaussians inside the walked volume. The most
+    # aggressive interior rule available; walls are outside the hull so it cannot
+    # reach them, but poorly-tracked furniture can be.
+    hull_air: bool = False
 
 
 @dataclass
@@ -588,6 +592,7 @@ def cleanup_particlefield_file(
             air_min_neighbors=params.air_min_neighbors,
             air_neighbor_radius_frac=params.air_neighbor_radius_frac,
             free_behind=params.free_behind,
+            hull_air=params.hull_air,
         )
 
     keep, removed = compute_keep_mask(
@@ -802,6 +807,8 @@ def cleanup_particlefield_via_isaac(
     )
     if params.free_behind:
         args.append("--free-behind")
+    if params.hull_air:
+        args.append("--hull-air")
     if params.max_needle_ratio is not None:
         args.extend(["--max-needle-ratio", str(params.max_needle_ratio)])
     if params.max_scale is not None:

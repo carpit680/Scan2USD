@@ -58,6 +58,7 @@ def main() -> None:
     parser.add_argument("--air-min-neighbors", type=int, default=0)
     parser.add_argument("--air-neighbor-radius-frac", type=float, default=0.01)
     parser.add_argument("--free-behind", action="store_true")
+    parser.add_argument("--hull-air", action="store_true")
     parser.add_argument("--observed-min", type=float, nargs=3, default=None)
     parser.add_argument("--observed-max", type=float, nargs=3, default=None)
     parser.add_argument("--raw-backup", type=Path, default=None)
@@ -86,6 +87,7 @@ def main() -> None:
         air_min_neighbors=args.air_min_neighbors,
         air_neighbor_radius_frac=args.air_neighbor_radius_frac,
         free_behind=args.free_behind,
+        hull_air=args.hull_air,
     )
     report = cleanup_particlefield_file(
         args.input,

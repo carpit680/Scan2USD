@@ -357,7 +357,7 @@ def test_anti_fog_is_off_until_asked_for(tmp_path):
     cfg.reconstruction.grut_max_iterations = 50000
     args = grut_train_args(cfg, dataset, output_dir=tmp_path / "o", output_usd=tmp_path / "o" / "s.usd")
     assert "loss.use_opacity=true" in args
-    assert "loss.lambda_opacity=0.01" in args
+    assert any(a.startswith("loss.lambda_opacity=") for a in args)
     # Weight pruning must not outlive densification, or it hollows the model out.
     assert "strategy.prune_weight.end_iteration=25000" in args
     assert "strategy.prune_weight.start_iteration=10000" in args

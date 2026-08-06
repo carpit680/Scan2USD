@@ -270,6 +270,10 @@ class SplatCleanupConfig:
     # them, so they are not the surface that stopped the rays. Unlike the density
     # rule this never touches anything that occludes, textureless or not.
     free_behind: bool = False
+    # Remove every non-surface Gaussian inside the walked volume. Walls sit
+    # outside the camera hull so they are safe, but poorly-tracked furniture is
+    # not — verify against held-out PSNR before enabling.
+    hull_air: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> SplatCleanupConfig:
@@ -297,6 +301,7 @@ class SplatCleanupConfig:
             air_min_neighbors=int(raw.get("air_min_neighbors", 0)),
             air_neighbor_radius_frac=float(raw.get("air_neighbor_radius_frac", 0.01)),
             free_behind=bool(raw.get("free_behind", False)),
+            hull_air=bool(raw.get("hull_air", False)),
         )
 
     def to_params(self):
@@ -322,6 +327,7 @@ class SplatCleanupConfig:
             air_min_neighbors=self.air_min_neighbors,
             air_neighbor_radius_frac=self.air_neighbor_radius_frac,
             free_behind=self.free_behind,
+            hull_air=self.hull_air,
         )
 
 

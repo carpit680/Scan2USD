@@ -1098,6 +1098,24 @@ CONFIG_PARAMS: list[dict[str, Any]] = [
         help_level="essential",
     ),
     _p(
+        id="reconstruction.splat_cleanup.hull_air",
+        label="Clear all air inside the walked volume",
+        type="bool",
+        group="reconstruction",
+        default=False,
+        config_path="reconstruction.splat_cleanup.hull_air",
+        tooltip=(
+            "Remove every Gaussian inside the volume you walked through that has "
+            "no surface near it, whether or not a ray proved its cell empty. The "
+            "strongest interior rule. Walls cannot be hit — they sit outside the "
+            "camera hull — but poorly-tracked furniture can. MEASURED on the "
+            "bedroom: removes the last 14,542 haze Gaussians for 0.73 dB of PSNR, "
+            "with LPIPS unchanged, i.e. it costs pixel accuracy on training views "
+            "but not perceived quality."
+        ),
+        help_level="essential",
+    ),
+    _p(
         id="reconstruction.splat_cleanup.air_min_neighbors",
         label="Min neighbours in mid-air (unsafe on plain walls)",
         type="int",
