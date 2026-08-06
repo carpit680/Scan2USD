@@ -266,6 +266,10 @@ class SplatCleanupConfig:
     # Reaches what carving cannot prove empty. 0 disables.
     air_min_neighbors: int = 0
     air_neighbor_radius_frac: float = 0.01
+    # Remove Gaussians with carved-empty space behind them: the cameras saw past
+    # them, so they are not the surface that stopped the rays. Unlike the density
+    # rule this never touches anything that occludes, textureless or not.
+    free_behind: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> SplatCleanupConfig:
@@ -292,6 +296,7 @@ class SplatCleanupConfig:
             surface_radius_frac=float(raw.get("surface_radius_frac", 0.015)),
             air_min_neighbors=int(raw.get("air_min_neighbors", 0)),
             air_neighbor_radius_frac=float(raw.get("air_neighbor_radius_frac", 0.01)),
+            free_behind=bool(raw.get("free_behind", False)),
         )
 
     def to_params(self):
@@ -316,6 +321,7 @@ class SplatCleanupConfig:
             surface_radius_frac=self.surface_radius_frac,
             air_min_neighbors=self.air_min_neighbors,
             air_neighbor_radius_frac=self.air_neighbor_radius_frac,
+            free_behind=self.free_behind,
         )
 
 

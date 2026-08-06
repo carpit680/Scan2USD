@@ -963,8 +963,23 @@ CONFIG_PARAMS: list[dict[str, Any]] = [
         ),
     ),
     _p(
+        id="reconstruction.splat_cleanup.free_behind",
+        label="Remove what the cameras saw past",
+        type="bool",
+        group="reconstruction",
+        default=False,
+        config_path="reconstruction.splat_cleanup.free_behind",
+        tooltip=(
+            "Delete Gaussians with carved-empty space BEHIND them. If the cameras "
+            "saw past it, it is not the surface that stopped them. Safe on plain "
+            "walls, which the neighbour-count rule below is not: nothing is behind "
+            "a wall, so no ray ever reaches there and it is left alone."
+        ),
+        help_level="essential",
+    ),
+    _p(
         id="reconstruction.splat_cleanup.air_min_neighbors",
-        label="Min neighbours in mid-air",
+        label="Min neighbours in mid-air (unsafe on plain walls)",
         type="int",
         group="reconstruction",
         default=0,
@@ -973,13 +988,13 @@ CONFIG_PARAMS: list[dict[str, Any]] = [
         max=400,
         step=10,
         tooltip=(
-            "Delete Gaussians that are far from every reconstructed point AND have "
-            "fewer than this many neighbours. Reaches the haze that carving cannot "
-            "prove empty, because rays only travel toward tracked points and never "
-            "cross the air in front of a blank wall. A real surface the tracker "
-            "missed — a white ceiling — survives, because it is still a dense sheet "
-            "(median 687 neighbours here) while haze is diffuse (median 51). "
-            "80 measured on the bedroom; 0 disables."
+            "Delete Gaussians far from every reconstructed point AND with fewer "
+            "than this many neighbours. MEASURED HARMFUL on room scans: a plain "
+            "wall has no texture, so no reconstructed points and few large "
+            "Gaussians — sparse by both tests. On the bedroom this removed 37,378 "
+            "Gaussians carrying 57.5% of the blocking mass with nothing behind "
+            "them, i.e. the walls. Prefer the option above. Kept for "
+            "object-centric captures. 0 disables."
         ),
         help_level="essential",
         widget="slider",

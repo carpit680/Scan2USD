@@ -394,6 +394,7 @@ def free_space_removal_mask(
     surface_radius_frac: float = SURFACE_RADIUS_FRAC,
     air_min_neighbors: int = 0,
     air_neighbor_radius_frac: float = 0.01,
+    free_behind: bool = False,
 ) -> tuple[np.ndarray, dict]:
     """
     Mask of Gaussians to delete: in the air, by two independent kinds of evidence.
@@ -406,17 +407,25 @@ def free_space_removal_mask(
        points, so the volume in front of a textureless wall is never carved. On
        the bedroom this leaves 20,609 haze Gaussians untouched.
 
-    2. **Sparse in the air** — far from any SfM point *and* with few neighbours.
-       This is what separates haze from a real surface the tracker missed. A
-       white ceiling produces almost no SfM points, so criterion 1's protection
-       does not cover it; but it is still a densely packed sheet (median 687
-       neighbours within 1% of the room) while haze is diffuse (median 51).
+    2. **Nothing carved behind it** (``free_behind``) — the cameras saw *past*
+       this Gaussian, so it is not the surface that stopped them. Extends the
+       reach of (1) to Gaussians sitting just off a ray path, while still
+       refusing to touch anything that occludes.
 
-    Measured on the bedroom, and worth recording because it inverts the obvious
-    guess: haze here is *flat discs*, not spikes. Its needle ratio (s2/s1) runs
-    lower than the surfaces' — 2.5 against 3.7 — so ``max_needle_ratio`` removes
-    more surface than haze at every threshold, which is exactly why applying it
-    globally cost 3-6 dB. Density is the axis that actually separates the two.
+    Two rules that look reasonable and are not, both measured here rather than
+    argued about:
+
+    - ``max_needle_ratio``: haze in this scene is *flat discs*, not spikes. Its
+      needle ratio (s2/s1) runs lower than the surfaces' own — 2.5 against 3.7 —
+      so the filter removes more surface than haze at every threshold. That is
+      why applying it globally cost 3-6 dB.
+    - ``air_min_neighbors``: haze is 13x sparser than surfaces *near SfM points*
+      (51 neighbours against 687), which looks decisive until you notice that
+      comparison excludes the population at risk. A plain wall has no texture,
+      hence no SfM points, and 3DGS fits it with few large Gaussians — sparse by
+      both measures. On the bedroom this deleted 37,378 Gaussians carrying 57.5%
+      of the model's blocking mass with nothing carved behind them: the walls.
+      It is kept only for object-centric captures and defaults off.
     """
     positions = np.asarray(positions, dtype=np.float64)
     grid = carve.grid
@@ -430,6 +439,13 @@ def free_space_removal_mask(
     carved = in_air & (carve.free[voxel_of] >= int(min_free_votes))
     remove = carved.copy()
 
+    behind_removed = 0
+    if free_behind:
+        behind = free_on_far_side(positions, carve, min_free_votes=min_free_votes)
+        occluded_free = in_air & behind
+        behind_removed = int(np.count_nonzero(occluded_free & ~remove))
+        remove |= occluded_free
+
     sparse_removed = 0
     if int(air_min_neighbors) > 0:
         counts = _neighbor_counts(positions, float(air_neighbor_radius_frac) * span)
@@ -441,6 +457,7 @@ def free_space_removal_mask(
         "removed_free_space": int(np.count_nonzero(remove)),
         "removed_carved": int(np.count_nonzero(carved)),
         "removed_sparse_air": sparse_removed,
+        "removed_free_behind": behind_removed,
         # Zero by construction -- the rules exclude near-surface Gaussians. Kept
         # in the report so a future change that breaks that shows up immediately.
         "free_space_surface_loss": int(np.count_nonzero(remove & near_surface)),
@@ -457,3 +474,44 @@ def _neighbor_counts(points: np.ndarray, radius: float) -> np.ndarray:
 
     tree = cKDTree(points)
     return np.asarray(tree.query_ball_point(points, radius, return_length=True)) - 1
+
+
+def free_on_far_side(
+    positions: np.ndarray,
+    carve: CarveResult,
+    *,
+    min_free_votes: int = 3,
+    probe_voxels: tuple[float, ...] = (2.0, 4.0, 8.0),
+) -> np.ndarray:
+    """
+    Is there carved-empty space *behind* each Gaussian, seen from the camera?
+
+    This is what separates haze from a surface, and it works where a density
+    test cannot. Density looked decisive when haze was compared against surfaces
+    near SfM points -- 51 neighbours against 687 -- but that comparison excluded
+    the population most at risk. A plain wall has no texture, so it has no SfM
+    points *and* 3DGS fits it with few large Gaussians: sparse by both measures,
+    and a density rule deletes it.
+
+    What actually distinguishes them is occlusion. Nothing is behind a wall, so
+    no ray ever reaches there and the volume stays uncarved. Haze has the rest of
+    the room behind it, crossed by every ray heading for that same wall. So:
+    empty space on the far side means the cameras saw *past* this Gaussian, and
+    whatever it is, it is not the surface that stopped them.
+    """
+    positions = np.asarray(positions, dtype=np.float64)
+    from scipy.spatial import cKDTree
+
+    _distance, nearest = cKDTree(carve.centres).query(positions, k=1)
+    direction = positions - carve.centres[nearest]
+    norm = np.linalg.norm(direction, axis=1, keepdims=True)
+    direction = direction / np.maximum(norm, 1e-9)
+
+    behind_free = np.zeros(len(positions), dtype=bool)
+    for step in probe_voxels:
+        probe = positions + direction * (step * carve.grid.voxel)
+        inside = carve.grid.contains(probe)
+        votes = np.zeros(len(positions), dtype=np.uint32)
+        votes[inside] = carve.free[carve.grid.index_of(probe[inside])]
+        behind_free |= inside & (votes >= int(min_free_votes))
+    return behind_free

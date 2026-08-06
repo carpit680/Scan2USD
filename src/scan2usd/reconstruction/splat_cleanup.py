@@ -73,6 +73,9 @@ class SplatCleanupParams:
     # (a white ceiling) stays because it is still a densely packed sheet.
     air_min_neighbors: int = 0
     air_neighbor_radius_frac: float = 0.01
+    # Also remove Gaussians the cameras saw straight past. Safe where the
+    # density rule is not: anything that occludes is left alone.
+    free_behind: bool = False
 
 
 @dataclass
@@ -584,6 +587,7 @@ def cleanup_particlefield_file(
             surface_radius_frac=params.surface_radius_frac,
             air_min_neighbors=params.air_min_neighbors,
             air_neighbor_radius_frac=params.air_neighbor_radius_frac,
+            free_behind=params.free_behind,
         )
 
     keep, removed = compute_keep_mask(
@@ -796,6 +800,8 @@ def cleanup_particlefield_via_isaac(
             str(params.air_neighbor_radius_frac),
         ]
     )
+    if params.free_behind:
+        args.append("--free-behind")
     if params.max_needle_ratio is not None:
         args.extend(["--max-needle-ratio", str(params.max_needle_ratio)])
     if params.max_scale is not None:
