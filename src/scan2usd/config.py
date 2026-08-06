@@ -250,6 +250,17 @@ class SplatCleanupConfig:
     needle_min_length_frac: float = 0.005
     min_view_count: int = 0
     min_keep_fraction: float = 0.05
+    # Free-space carving: delete Gaussians sitting in volume the cameras
+    # demonstrably looked *through* and with no surface nearby. Unlike every
+    # filter above, this judges a Gaussian by where it is against direct camera
+    # evidence rather than by how it looks, which is why it can remove interior
+    # haze that opacity and scale thresholds cannot reach. 0 disables it.
+    free_space_votes: int = 0
+    carve_resolution: int = 256
+    carve_max_rays: int = 400_000
+    # Gaussians within this fraction of the observed diagonal of an SfM point
+    # are carrying a surface and are never removed by the carve.
+    surface_radius_frac: float = 0.015
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> SplatCleanupConfig:
@@ -270,6 +281,10 @@ class SplatCleanupConfig:
             needle_min_length_frac=float(raw.get("needle_min_length_frac", 0.005)),
             min_view_count=int(raw.get("min_view_count", 0)),
             min_keep_fraction=float(raw.get("min_keep_fraction", 0.05)),
+            free_space_votes=int(raw.get("free_space_votes", 0)),
+            carve_resolution=int(raw.get("carve_resolution", 256)),
+            carve_max_rays=int(raw.get("carve_max_rays", 400_000)),
+            surface_radius_frac=float(raw.get("surface_radius_frac", 0.015)),
         )
 
     def to_params(self):
@@ -288,6 +303,10 @@ class SplatCleanupConfig:
             needle_min_length_frac=self.needle_min_length_frac,
             min_view_count=self.min_view_count,
             min_keep_fraction=self.min_keep_fraction,
+            free_space_votes=self.free_space_votes,
+            carve_resolution=self.carve_resolution,
+            carve_max_rays=self.carve_max_rays,
+            surface_radius_frac=self.surface_radius_frac,
         )
 
 

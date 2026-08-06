@@ -25,55 +25,18 @@ capture:
 reconstruction:
   visual_backend: 3dgrut
   rgbd_geometry_backend: nvblox
-  # Collision mesh fitted to the splat's own Gaussian centres rather than a
-  # separate multi-view-stereo run. Two reasons: OpenMVS collapses on white
-  # walls (the kitchen produced a 20-vertex hull), and a separate reconstruction
-  # has to be registered against the splat — that drift measured 12.6 units.
-  # Fitting the surface to the Gaussians makes it aligned by construction.
   rgb_geometry_backend: splat
   min_registration_rate: 0.7
-  # Laplacian blur filtering is DISABLED for this capture: the metric is
-  # resolution-dependent and meaningless at 4K (the same sharp frame scores ~20 at
-  # 720p and ~3.5 at 4K), so a 720p-tuned threshold of 50 would reject 95% of
-  # perfectly sharp footage.
   blur_threshold: 0
-  # Feature count is what actually predicts COLMAP success, and it is
-  # resolution-independent. Measured on this capture (normalised to 1280px):
-  # median 822 features, but the worst quartile is under 263 — long stretches
-  # pointed at blank white ceiling and walls. Those frames are sharp and useless.
-  # 300 drops roughly the worst 27%.
   min_frame_features: 300
-  # 0 = keep native, which is what THIS run used (frames were already extracted
-  # at 4K before the option existed). For a fresh capture set 1920: the distro
-  # COLMAP is built WITHOUT CUDA (`colmap --help` reports "without CUDA"), so
-  # SIFT is CPU-bound regardless of --use_gpu, and COLMAP clamps its own working
-  # size to 3200px anyway — so 4K pixels are decoded and then discarded.
-  # Pair frame_max_dim: 1920 with grut_downscale: 1.
   frame_max_dim: 0
-  # Train at half resolution (1080x1920). Cost per iteration scales with pixels:
-  # 4K is ~9x a 720p frame, which would put 50k iterations into the many-hours
-  # range and press hard on 8 GB. Half-res is still 2.25x the kitchen's detail.
-  # COLMAP intrinsics are rescaled to match automatically.
-  # Frames on disk are 4K, so halve them at staging: training cost scales with
-  # pixels per iteration and 4K would be ~9x a 720p frame (many hours at 50k).
-  # 1080x1920 is still 2.25x the kitchen's detail. COLMAP intrinsics are
-  # rescaled to match automatically.
   grut_downscale: 2
-  # MCMC was tried twice on this 8 GB card and failed both times:
-  #   relocate/add ending at 25k -> opacity regularisation decayed the model,
-  #     99% of Gaussians ended at zero opacity (0.3% usable)
-  #   relocate/add running to 45k -> memory grew until OOM at step 33k; the
-  #     surviving 30k checkpoint still had only 15% of Gaussians above 0.01
-  # The standard 3DGUT schedule produced a healthy 940k-Gaussian kitchen scene
-  # on the same hardware, so that is the default until MCMC is validated
-  # separately with a smaller Gaussian budget.
   grut_config: apps/colmap_3dgut.yaml
   grut_max_iterations: 50000
   held_out_ratio: 0.1
   preview_allow_unobserved_background: false
   grut_overrides:
   - scheduler.positions.max_steps=50000
-  # Standard 3DGUT densification (the MCMC relocate/add keys do not exist here).
   - strategy.densify.end_iteration=25000
   - loss.lambda_ssim=0.25
   - model.progressive_training.increase_frequency=500
@@ -84,10 +47,11 @@ reconstruction:
     min_opacity: 0.01
     max_scale: null
     max_scale_frac: 0.08
-    crop_margin: 0.5
+    crop_margin: 0.25
     min_neighbors: 0
     max_needle_ratio: null
     min_view_count: 0
+    free_space_votes: 3
 segmentation:
   proposal_model: yolov8s-worldv2.pt
   mask_model: sam2

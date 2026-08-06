@@ -924,6 +924,71 @@ CONFIG_PARAMS: list[dict[str, Any]] = [
         widget="slider",
     ),
     _p(
+        id="reconstruction.splat_cleanup.free_space_votes",
+        label="Free-space carving (rays)",
+        type="int",
+        group="reconstruction",
+        default=0,
+        config_path="reconstruction.splat_cleanup.free_space_votes",
+        min=0,
+        max=50,
+        step=1,
+        tooltip=(
+            "Delete Gaussians sitting in volume the cameras demonstrably looked "
+            "THROUGH. Every camera-to-SfM-point pair is a ray whose interior must "
+            "be empty, and a Gaussian needs this many rays through its cell before "
+            "it counts as floating. Unlike opacity or size thresholds this judges a "
+            "Gaussian by where it is against direct evidence, so it reaches interior "
+            "haze that the other filters cannot. Gaussians near a real surface are "
+            "never removed. 3 is the measured-safe setting; 0 disables."
+        ),
+        help_level="essential",
+        widget="slider",
+    ),
+    _p(
+        id="reconstruction.splat_cleanup.surface_radius_frac",
+        label="Surface protection radius",
+        type="float",
+        group="reconstruction",
+        default=0.015,
+        config_path="reconstruction.splat_cleanup.surface_radius_frac",
+        min=0.002,
+        max=0.06,
+        step=0.001,
+        tooltip=(
+            "A Gaussian this close to any SfM point is carrying a surface and is "
+            "never removed by free-space carving, as a fraction of the observed "
+            "diagonal. Raise it if thin structures (chair legs, cables) start "
+            "disappearing; lower it if haze survives right against surfaces."
+        ),
+    ),
+    _p(
+        id="reconstruction.splat_cleanup.carve_resolution",
+        label="Carve grid resolution",
+        type="int",
+        group="reconstruction",
+        default=256,
+        config_path="reconstruction.splat_cleanup.carve_resolution",
+        min=64,
+        max=512,
+        step=32,
+        tooltip="Voxels along the longest axis of the observed volume when carving. Higher is finer but needs more rays to fill.",
+        help_level="advanced",
+    ),
+    _p(
+        id="reconstruction.splat_cleanup.carve_max_rays",
+        label="Carve rays",
+        type="int",
+        group="reconstruction",
+        default=400000,
+        config_path="reconstruction.splat_cleanup.carve_max_rays",
+        min=50000,
+        max=4000000,
+        step=50000,
+        tooltip="Camera-to-point rays sampled when carving free space. More rays give better coverage of empty volume at linear cost.",
+        help_level="advanced",
+    ),
+    _p(
         id="reconstruction.splat_cleanup.min_view_count",
         label="Min cameras seeing it",
         type="int",

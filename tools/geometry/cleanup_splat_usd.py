@@ -45,6 +45,16 @@ def main() -> None:
     parser.add_argument("--needle-min-length-frac", type=float, default=0.005)
     parser.add_argument("--min-view-count", type=int, default=0)
     parser.add_argument("--colmap-txt", type=Path, default=None)
+    parser.add_argument(
+        "--colmap-sparse",
+        type=Path,
+        default=None,
+        help="COLMAP sparse/0 with .bin files, for free-space carving and fog metrics",
+    )
+    parser.add_argument("--free-space-votes", type=int, default=0)
+    parser.add_argument("--carve-resolution", type=int, default=256)
+    parser.add_argument("--carve-max-rays", type=int, default=400_000)
+    parser.add_argument("--surface-radius-frac", type=float, default=0.015)
     parser.add_argument("--observed-min", type=float, nargs=3, default=None)
     parser.add_argument("--observed-max", type=float, nargs=3, default=None)
     parser.add_argument("--raw-backup", type=Path, default=None)
@@ -66,6 +76,10 @@ def main() -> None:
         max_needle_ratio=args.max_needle_ratio,
         needle_min_length_frac=args.needle_min_length_frac,
         min_view_count=args.min_view_count,
+        free_space_votes=args.free_space_votes,
+        carve_resolution=args.carve_resolution,
+        carve_max_rays=args.carve_max_rays,
+        surface_radius_frac=args.surface_radius_frac,
     )
     report = cleanup_particlefield_file(
         args.input,
@@ -74,6 +88,7 @@ def main() -> None:
         raw_backup_path=args.raw_backup,
         observed_bounds=bounds,
         colmap_txt_dir=args.colmap_txt,
+        colmap_sparse_dir=args.colmap_sparse,
     )
     write_report_json(report, args.report)
     print(json.dumps(report.to_dict()), flush=True)

@@ -24,6 +24,10 @@ class ImagePose:
     camera_id: int
     name: str
 
+    def camera_center(self) -> np.ndarray:
+        """Where the camera sat, in COLMAP world space."""
+        return -quat_to_rotmat(self.qvec).T @ self.tvec
+
 
 def quat_to_rotmat(qvec: np.ndarray) -> np.ndarray:
     """COLMAP world-to-camera rotation from quaternion (w,x,y,z)."""

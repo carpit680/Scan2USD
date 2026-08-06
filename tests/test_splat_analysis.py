@@ -9,21 +9,10 @@ plausible numbers, so both are pinned here.
 
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
-
 import numpy as np
 import pytest
 
-_SPEC = importlib.util.spec_from_file_location(
-    "analyze_splat",
-    Path(__file__).resolve().parents[1] / "tools" / "geometry" / "analyze_splat.py",
-)
-analyze_splat = importlib.util.module_from_spec(_SPEC)
-# @dataclass resolves annotations through sys.modules, so register before exec.
-sys.modules[_SPEC.name] = analyze_splat
-_SPEC.loader.exec_module(analyze_splat)
+from scan2usd.reconstruction import free_space as analyze_splat
 
 
 def _box_room(rng, n=4000):
@@ -142,3 +131,55 @@ def test_points_outside_the_grid_are_excluded_not_clamped():
     probes = np.array([[0.0, 0.0, 1.5], [900.0, 900.0, 900.0]])
     inside = grid.contains(probes)
     assert inside[0] and not inside[1]
+
+
+def _carved_room(rng, n=6000):
+    """A box room with wall points, an inside camera ring, and its carve."""
+    wall, cameras = _box_room(rng, n)
+    centres = {i: c for i, c in enumerate(cameras)}
+    tracks = [np.arange(len(cameras)) for _ in range(len(wall))]
+    reference = analyze_splat.observed_reference_bounds(wall, cameras)
+    grid = analyze_splat.build_grid(
+        reference, 64, dilation=analyze_splat.OBSERVED_DILATION
+    )
+    free, occupied = analyze_splat.carve_free_space(
+        grid, centres, wall, tracks, max_rays=300_000, stop_margin=3.0 * grid.voxel
+    )
+    return analyze_splat.CarveResult(
+        grid=grid,
+        free=free,
+        occupied=occupied,
+        points=wall,
+        centres=cameras,
+        reference=reference,
+    )
+
+
+def test_removal_mask_deletes_midair_gaussians_and_spares_wall_ones():
+    rng = np.random.default_rng(11)
+    carve = _carved_room(rng)
+    midair = np.array([[0.0, 0.0, 1.5], [0.3, -0.2, 1.4]])
+    on_wall = carve.points[:50]
+    positions = np.vstack([midair, on_wall])
+
+    remove, stats = analyze_splat.free_space_removal_mask(
+        positions, carve, min_free_votes=3
+    )
+    assert remove[: len(midair)].all(), "haze in carved-empty air must be removed"
+    assert not remove[len(midair) :].any(), "Gaussians on a wall must survive"
+    assert stats["free_space_surface_loss"] == 0
+
+
+def test_more_votes_never_removes_more():
+    """Raising the threshold must be monotonically more conservative."""
+    rng = np.random.default_rng(12)
+    carve = _carved_room(rng)
+    probes = np.vstack(
+        [np.column_stack([rng.uniform(-1, 1, 300), rng.uniform(-1, 1, 300),
+                          rng.uniform(1.0, 2.0, 300)]), carve.points[:200]]
+    )
+    counts = [
+        int(analyze_splat.free_space_removal_mask(probes, carve, min_free_votes=v)[0].sum())
+        for v in (1, 3, 10, 30)
+    ]
+    assert counts == sorted(counts, reverse=True)

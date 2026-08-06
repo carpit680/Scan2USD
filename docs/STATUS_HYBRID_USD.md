@@ -139,6 +139,63 @@ Conclusions:
   ``threedgrut/export/scripts/filter_visibility.py`` accumulates per-Gaussian
   ``mog_visibility`` from actual renders — which is the correct next step.
 
+Fog measurement and free-space carving (2026-08-05)
+----------------------------------------------------
+The conclusion above — "the remaining haze is representational" — held for
+*exterior* views but was never tested against the interior, because there was no
+interior haze metric. ``tools/geometry/analyze_splat.py`` supplies one, and
+``reconstruction/free_space.py`` turns it into a filter.
+
+Method: every (camera, SfM point) pair is a ray whose interior must be empty,
+since the camera saw that point. Voxels along those rays are carved free. A
+Gaussian in carved-free space with no surface within a fixed radius is an
+artifact by construction rather than by threshold. Both conditions are required:
+a featureless white wall has few SfM points, but nothing behind it to aim rays
+at either, so it never reads as haze.
+
+Two measurement bugs found and fixed before any number here was trusted:
+
+- **Grid sized to the Gaussians** made every result incomparable between models.
+  The bedroom's raw export spans 574 units because of a few strays (1.36-unit
+  voxels, 57-voxel camera hull); the cleaned model spans 47 (0.15-unit voxels,
+  48,832). Comparing them measured the grid, and made cleanup look like it was
+  *creating* fog. The grid now spans camera positions unioned with the 5-95
+  percentile of SfM points — camera centres have no outlier tail and match the
+  5-95 point extent within a few percent, while the 1-99 percentile still spans
+  69.7 units.
+- **"On a surface" defined as shared voxel occupancy** tracked the resolution:
+  82% of the model read as surface at 0.35-unit voxels, 71% at 0.06-unit. It is
+  now a fixed metric radius.
+
+Bedroom, one consistent definition (crop 0.5 -> 0.25, free_space_votes 3):
+
+  ==========================================  =========  =========
+  metric                                       before     after
+  ==========================================  =========  =========
+  fog inside the camera path                   34,653     20,609
+  fog as fraction of what is in there          28.1%      18.8%
+  transmittance across the room                6.7%       10.7%
+  blocking mass outside the observed volume    40.3%      10.8%
+  held-out quality score                       65.97      65.76
+  ==========================================  =========  =========
+
+Conclusions:
+
+- The carve removes exactly what it can prove (16,621 Gaussians) at no cost to
+  surfaces, and the tighter crop cuts exterior blocking mass by four. LPIPS
+  *improved* (0.401 -> 0.390) while PSNR fell 0.75 dB, which is the expected
+  signature of deleting semi-transparent haze: it was contributing a small
+  correct-on-average signal that PSNR rewards and perception does not.
+- **Post-hoc carving cannot finish the job.** 20,609 Gaussians remain in the
+  walked volume with no surface near them, in voxels no ray reaches — rays only
+  travel toward SfM points, so volume in front of textureless surfaces is never
+  carved. Transmittance 10.7% is still far from clear.
+- That residue is a *training* problem, which is what the anti-fog work targets:
+  3DGRUT already ships ``loss.use_opacity`` and ``strategy.prune_weight``
+  (accumulated-evidence pruning), both disabled by default. The literature is
+  explicit that photometric loss alone cannot remove floaters, because their
+  opacity gradients vanish once the blended colour reaches equilibrium.
+
 Two bugs found by running this for real, both fixed:
 
 1. ``tools/isaac/render_heldout.py`` produced zero images — ``app.update()`` does

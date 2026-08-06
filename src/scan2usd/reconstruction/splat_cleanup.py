@@ -59,6 +59,15 @@ class SplatCleanupParams:
     # Gaussians at zero opacity, and without this the build "succeeds" with an
     # empty scene. 0 disables the check.
     min_keep_fraction: float = 0.05
+    # Free-space carving. Judges a Gaussian by where it sits against direct
+    # camera evidence rather than by how it looks, which is what lets it reach
+    # interior haze: opacity and scale thresholds cannot separate a hazy
+    # Gaussian from a faint real one, but "the cameras saw straight through
+    # here" is not a matter of degree. 0 disables.
+    free_space_votes: int = 0
+    carve_resolution: int = 256
+    carve_max_rays: int = 400_000
+    surface_radius_frac: float = 0.015
 
 
 @dataclass
@@ -78,6 +87,9 @@ class SplatCleanupReport:
     removed_density: int = 0
     removed_needle: int = 0
     removed_visibility: int = 0
+    removed_free_space: int = 0
+    fog_metrics: dict[str, Any] | None = None
+    free_space_error: str | None = None
     scene_diagonal: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -159,6 +171,82 @@ def _neighbor_counts(points: np.ndarray, radius: float) -> np.ndarray:
         return counts[inverse] - 1
 
 
+def _carve(positions: np.ndarray, sparse_dir: Path, params: SplatCleanupParams):
+    """Carve the volume the cameras saw through. Reused for removal and metrics."""
+    from scan2usd.reconstruction.free_space import carve_from_colmap
+
+    return carve_from_colmap(
+        positions,
+        sparse_dir,
+        resolution=params.carve_resolution,
+        max_rays=params.carve_max_rays,
+    )
+
+
+def fog_metrics_from_carve(
+    carve: Any,
+    positions: np.ndarray,
+    opacities: np.ndarray,
+    scales: np.ndarray,
+    params: SplatCleanupParams,
+) -> dict[str, Any]:
+    """
+    How hazy the air is, for the Gaussians given.
+
+    Deliberately *not* the filter's own predicate. Re-running "carved free and
+    not near a surface" on the set just filtered by that predicate returns zero
+    every time by construction, which reports a perfectly clear room whatever
+    the scene actually looks like. Haze is measured here by the independent
+    half of the test — inside the camera path with no surface nearby — so
+    Gaussians the carve could not prove empty still count against the score.
+
+    ``transmittance_across_room`` is the number to watch: the fraction of a view
+    that survives crossing the room, which is what "cloudy" means and what
+    held-out PSNR cannot see.
+    """
+    from scan2usd.reconstruction.free_space import (
+        inside_camera_hull,
+        within_surface_radius,
+    )
+
+    positions = np.asarray(positions, dtype=np.float64)
+    radius = float(params.surface_radius_frac) * float(
+        np.linalg.norm(carve.reference[1] - carve.reference[0])
+    )
+    near_surface = within_surface_radius(positions, carve.points, radius)
+    in_hull = inside_camera_hull(positions, carve.centres) & carve.grid.contains(positions)
+    hull_fog = in_hull & ~near_surface
+
+    scales_arr = np.asarray(scales, dtype=np.float64)
+    scale_mid = np.sort(scales_arr, axis=1)[:, 1] if scales_arr.ndim == 2 else scales_arr
+    cross_section = np.asarray(opacities, dtype=np.float64).reshape(-1) * np.pi * scale_mid**2
+
+    from scan2usd.reconstruction.free_space import hull_voxel_indices
+
+    hull_voxels = hull_voxel_indices(carve.grid, carve.centres)
+    sigma = 0.0
+    if np.any(hull_fog) and len(hull_voxels):
+        totals = np.bincount(
+            carve.grid.index_of(positions[hull_fog]),
+            weights=cross_section[hull_fog],
+            minlength=carve.grid.size,
+        )
+        sigma = float(totals[hull_voxels].sum() / len(hull_voxels) / carve.grid.voxel**3)
+    lo, hi = carve.reference
+    room_span = float(np.linalg.norm(hi - lo))
+    return {
+        "gaussians_inside_hull": int(np.count_nonzero(in_hull)),
+        "fog_inside_hull": int(np.count_nonzero(hull_fog)),
+        "fog_fraction_of_inside": float(
+            np.count_nonzero(hull_fog) / max(np.count_nonzero(in_hull), 1)
+        ),
+        "extinction_per_unit": sigma,
+        "mean_free_path": float(1.0 / sigma) if sigma > 0 else None,
+        "transmittance_across_room": float(np.exp(-sigma * room_span)),
+        "room_span": room_span,
+    }
+
+
 def compute_keep_mask(
     positions: np.ndarray,
     opacities: np.ndarray,
@@ -176,6 +264,7 @@ def compute_keep_mask(
     min_view_count: int = 0,
     view_counts: np.ndarray | None = None,
     observed_bounds: tuple[np.ndarray, np.ndarray] | None = None,
+    free_space_remove: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, int]]:
     """
     Build a boolean keep mask for Gaussians.
@@ -205,6 +294,7 @@ def compute_keep_mask(
     removed_density = 0
     removed_needle = 0
     removed_visibility = 0
+    removed_free_space = 0
 
     if observed_bounds is not None:
         lo, hi = (np.asarray(observed_bounds[0], dtype=np.float64),
@@ -256,6 +346,11 @@ def compute_keep_mask(
         removed_visibility = int(np.count_nonzero(keep & ~seen_enough))
         keep &= seen_enough
 
+    if free_space_remove is not None:
+        carve_keep = ~np.asarray(free_space_remove, dtype=bool).reshape(n)
+        removed_free_space = int(np.count_nonzero(keep & ~carve_keep))
+        keep &= carve_keep
+
     if float(outlier_std) > 0.0 and np.count_nonzero(keep) >= 8:
         candidates = pts[keep]
         center = np.median(candidates, axis=0)
@@ -277,6 +372,7 @@ def compute_keep_mask(
         "removed_density": removed_density,
         "removed_needle": removed_needle,
         "removed_visibility": removed_visibility,
+        "removed_free_space": removed_free_space,
         "scene_diagonal": diagonal,
     }
 
@@ -416,6 +512,7 @@ def cleanup_particlefield_file(
     observed_bounds: tuple[np.ndarray, np.ndarray] | None = None,
     view_counts: np.ndarray | None = None,
     colmap_txt_dir: Path | None = None,
+    colmap_sparse_dir: Path | None = None,
 ) -> SplatCleanupReport:
     """Filter stray Gaussians in a ParticleField USD (requires OpenUSD ``pxr``)."""
     from pxr import Usd
@@ -453,6 +550,35 @@ def cleanup_particlefield_file(
         raise RuntimeError(f"Could not open ParticleField USD: {work_path}")
     prim = _find_particle_field_prim(stage)
     loaded = _load_gaussian_arrays(prim)
+
+    free_space_remove = None
+    fog_metrics: dict[str, Any] | None = None
+    free_space_error: str | None = None
+    carve = None
+    if colmap_sparse_dir is not None:
+        try:
+            carve = _carve(loaded["positions"], Path(colmap_sparse_dir), params)
+        except Exception as exc:  # noqa: BLE001
+            # Never mis-carve on a frame mismatch or a missing model: the rule is
+            # only meaningful if the Gaussians and the COLMAP points are in the
+            # same space, and a wrong carve deletes real surfaces.
+            free_space_error = f"{type(exc).__name__}: {exc}"
+    elif params.free_space_votes > 0:
+        free_space_error = (
+            "free_space_votes is set but no COLMAP sparse dir was supplied; "
+            "carving skipped"
+        )
+
+    if carve is not None and params.free_space_votes > 0:
+        from scan2usd.reconstruction.free_space import free_space_removal_mask
+
+        free_space_remove, _carve_stats = free_space_removal_mask(
+            loaded["positions"],
+            carve,
+            min_free_votes=params.free_space_votes,
+            surface_radius_frac=params.surface_radius_frac,
+        )
+
     keep, removed = compute_keep_mask(
         loaded["positions"],
         loaded["opacities"],
@@ -468,6 +594,7 @@ def cleanup_particlefield_file(
         needle_min_length_frac=params.needle_min_length_frac,
         min_view_count=params.min_view_count,
         view_counts=view_counts,
+        free_space_remove=free_space_remove,
         observed_bounds=observed_bounds,
     )
     filtered = filter_parallel_arrays(
@@ -504,6 +631,20 @@ def cleanup_particlefield_file(
     if work_path != input_path and work_path.name.endswith("_cleanup_src" + input_path.suffix):
         work_path.unlink(missing_ok=True)
 
+    # Measure the result, not the intent: fog after filtering is what the scene
+    # actually ships with, and it is the one number held-out PSNR cannot supply.
+    if carve is not None:
+        try:
+            fog_metrics = fog_metrics_from_carve(
+                carve,
+                loaded["positions"][keep],
+                np.asarray(loaded["opacities"]).reshape(-1)[keep],
+                np.asarray(loaded["scales"])[keep],
+                params,
+            )
+        except Exception as exc:  # noqa: BLE001
+            free_space_error = f"fog metrics unavailable: {type(exc).__name__}: {exc}"
+
     return SplatCleanupReport(
         input_count=int(loaded["positions"].shape[0]),
         kept_count=int(np.count_nonzero(keep)),
@@ -520,6 +661,9 @@ def cleanup_particlefield_file(
         removed_density=removed["removed_density"],
         removed_needle=removed["removed_needle"],
         removed_visibility=removed["removed_visibility"],
+        removed_free_space=removed["removed_free_space"],
+        fog_metrics=fog_metrics,
+        free_space_error=free_space_error,
         scene_diagonal=removed["scene_diagonal"],
     )
 
@@ -548,23 +692,36 @@ def view_counts_from_colmap(colmap_txt_dir: Path, splat_path: Path) -> np.ndarra
 def observed_bounds_from_colmap(
     cfg: Any,
     *,
-    percentile: float = 2.0,
+    percentile: float = 5.0,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """
-    Robust bounds of the reconstructed scene from the COLMAP sparse points.
+    Robust bounds of the reconstructed scene from the COLMAP sparse model.
 
-    Percentile-trimmed because SfM always leaves a few wild points, and using the
-    raw min/max would define an "observed volume" many times the real room.
+    Percentile-trimmed *and* unioned with the camera positions, because trimming
+    alone is not enough: on the bedroom the 2-98 percentile of SfM points still
+    spans 22 units against a 10-unit room, and the 1-99 percentile spans 69.7.
+    Camera centres have no such tail — the operator physically stood there — and
+    their bounds match the 5-95 point extent to within a few percent. Using the
+    looser box let `crop_margin` keep a halo the whole width of the scene.
     """
-    points_txt = Path(getattr(cfg, "colmap_txt_dir", "")) / "points3D.txt"
+    from scan2usd.reconstruction.colmap_io import parse_images_txt, parse_points3d_txt
+
+    txt_dir = Path(getattr(cfg, "colmap_txt_dir", ""))
+    points_txt = txt_dir / "points3D.txt"
     if not points_txt.is_file():
         return None
-    from scan2usd.reconstruction.colmap_io import parse_points3d_txt
-
     _ids, points = parse_points3d_txt(points_txt)
     if len(points) < 32:
         return None
     lo, hi = np.percentile(points, [percentile, 100.0 - percentile], axis=0)
+
+    images_txt = txt_dir / "images.txt"
+    if images_txt.is_file():
+        centres = [pose.camera_center() for pose in parse_images_txt(images_txt).values()]
+        if centres:
+            centre_arr = np.asarray(centres, dtype=np.float64)
+            lo = np.minimum(lo, centre_arr.min(axis=0))
+            hi = np.maximum(hi, centre_arr.max(axis=0))
     return np.asarray(lo), np.asarray(hi)
 
 
@@ -578,6 +735,7 @@ def cleanup_particlefield_via_isaac(
     report_path: Path | None = None,
     observed_bounds: tuple[np.ndarray, np.ndarray] | None = None,
     colmap_dir: Path | None = None,
+    colmap_sparse_dir: Path | None = None,
 ) -> SplatCleanupReport:
     """Run cleanup under Isaac's Python (has OpenUSD ParticleField schemas)."""
     from scan2usd.reconstruction.external_cli import ExternalToolAdapter, resolve_external_command
@@ -613,6 +771,20 @@ def cleanup_particlefield_via_isaac(
     ]
     if colmap_dir is not None:
         args.extend(["--colmap-txt", str(Path(colmap_dir).resolve())])
+    if colmap_sparse_dir is not None:
+        args.extend(["--colmap-sparse", str(Path(colmap_sparse_dir).resolve())])
+    args.extend(
+        [
+            "--free-space-votes",
+            str(params.free_space_votes),
+            "--carve-resolution",
+            str(params.carve_resolution),
+            "--carve-max-rays",
+            str(params.carve_max_rays),
+            "--surface-radius-frac",
+            str(params.surface_radius_frac),
+        ]
+    )
     if params.max_needle_ratio is not None:
         args.extend(["--max-needle-ratio", str(params.max_needle_ratio)])
     if params.max_scale is not None:
@@ -650,6 +822,10 @@ def cleanup_particlefield(
     if params.crop_margin is not None or params.max_scale_frac is not None:
         observed_bounds = observed_bounds_from_colmap(cfg)
     colmap_dir = Path(getattr(cfg, "colmap_txt_dir", "")) if params.min_view_count > 0 else None
+    # Carving and the fog metrics need per-point tracks (which cameras observed
+    # each point); only the binary sparse model carries those, not the TXT export.
+    sparse_dir = Path(getattr(cfg, "nerfstudio_data_dir", "")) / "colmap" / "sparse" / "0"
+    colmap_sparse_dir = sparse_dir if (sparse_dir / "points3D.bin").is_file() else None
     if not params.enabled:
         if output_path.resolve() != input_path.resolve():
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -677,6 +853,7 @@ def cleanup_particlefield(
             raw_backup_path=raw_backup_path,
             observed_bounds=observed_bounds,
             colmap_txt_dir=colmap_dir,
+            colmap_sparse_dir=colmap_sparse_dir,
         )
     except ImportError:
         return cleanup_particlefield_via_isaac(
@@ -687,6 +864,7 @@ def cleanup_particlefield(
             raw_backup_path=raw_backup_path,
             observed_bounds=observed_bounds,
             colmap_dir=colmap_dir,
+            colmap_sparse_dir=colmap_sparse_dir,
         )
 
 
