@@ -2,6 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { client } from "../api/client";
 import { useProject } from "../state/ProjectContext";
 
+interface PreviewMeta {
+  camera_position: [number, number, number];
+  look_at: [number, number, number];
+  up: [number, number, number];
+}
+
 interface PreviewStatus {
   has_small: boolean;
   small_bytes: number;
@@ -9,20 +15,26 @@ interface PreviewStatus {
   path: string;
   bytes: number;
   stale: boolean;
+  meta: PreviewMeta | null;
 }
 
 /**
  * Browser preview of the cleaned splat, before any USD or Isaac step.
  *
  * Checking a cleanup setting used to mean launching Isaac: ~80 seconds of
- * startup and the whole GPU held, which also blocks training. Here the splat is
- * a static file the browser renders, so two settings can be compared quickly and
- * a bad one is caught before it reaches a USD build.
+ * startup and the whole GPU held, which also blocks training. Here the splat
+ * renders in the browser's own GPU — which is also why it works from a remote
+ * machine: the server only ships a static file.
+ *
+ * Uses @mkkellogg/gaussian-splats-3d rather than aholo: aholo parses inside a
+ * worker whose failure leaves the promise permanently pending, so a broken
+ * environment looked identical to a slow parse. This engine loads our PLY
+ * directly and reports errors as errors.
  */
 export function PreviewPage() {
   const { loaded, setError, runCommand } = useProject();
   const container = useRef<HTMLDivElement>(null);
-  const disposer = useRef<(() => void) | null>(null);
+  const disposer = useRef<(() => Promise<void> | void) | null>(null);
   const [status, setStatus] = useState<PreviewStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState("");
@@ -39,82 +51,62 @@ export function PreviewPage() {
     if (loaded) void refresh();
   }, [loaded, refresh]);
 
-  useEffect(() => () => disposer.current?.(), []);
+  useEffect(
+    () => () => {
+      void disposer.current?.();
+    },
+    [],
+  );
 
-  const show = useCallback(async (small = false) => {
-    if (!container.current) return;
-    setLoading(true);
-    setProgress("loading viewer…");
-    try {
-      // Imported lazily: the engine is large, and most visits to this page are
-      // to read the status line rather than render a scene.
-      const aholo = await import("@manycore/aholo-viewer");
-      const { createViewer, SplatLoader, SplatUtils } = aholo as unknown as {
-        createViewer: (name: string, el: HTMLElement, cfg: object) => any;
-        SplatLoader: {
-          parseSplatData: (
-            type: number,
-            input: Uint8Array,
-            packType?: number,
-          ) => Promise<unknown>;
-          SplatFileType: Record<string, number>;
-          SplatPackType: Record<string, number>;
-        };
-        SplatUtils: { createSplat: (data: unknown) => Promise<unknown> };
-      };
+  const show = useCallback(
+    async (small = false) => {
+      if (!container.current) return;
+      setLoading(true);
+      setProgress("loading engine…");
+      try {
+        const GS = await import("@mkkellogg/gaussian-splats-3d");
 
-      disposer.current?.();
-      container.current.innerHTML = "";
-      const viewer = createViewer("scan2usd-preview", container.current, {});
+        await disposer.current?.();
+        disposer.current = null;
+        container.current.innerHTML = "";
 
-      setProgress("downloading splat…");
-      const response = await fetch(`/api/quality/preview.ply${small ? "?small=true" : ""}`);
-      if (!response.ok) throw new Error(await response.text());
-      const buffer = new Uint8Array(await response.arrayBuffer());
+        const meta = status?.meta;
+        const viewer = new GS.Viewer({
+          rootElement: container.current,
+          // The export applies the floor transform, so the scene is Z-up.
+          cameraUp: meta?.up ?? [0, 0, 1],
+          // A real capture pose partway along the path: the reconstruction is
+          // only valid where the camera actually went, and framing the whole
+          // scene would start outside the room, in the halo.
+          initialCameraPosition: meta?.camera_position ?? [0, -2, 1.5],
+          initialCameraLookAt: meta?.look_at ?? [0, 0, 1.2],
+          // Avoids needing COOP/COEP headers, which the Vite dev server and the
+          // ZeroTier remote path do not set.
+          sharedMemoryForWorkers: false,
+        });
 
-      setProgress(`parsing ${(buffer.length / 1048576).toFixed(0)} MB…`);
-      // The engine runs parsing in a module Worker built from a blob URL. When
-      // that worker fails to start, the returned promise never settles and the
-      // page sits on "parsing" forever with nothing in the console, so bound it
-      // and say so rather than hanging.
-      const data = await Promise.race([
-        SplatLoader.parseSplatData(
-          SplatLoader.SplatFileType.PLY,
-          buffer,
-          SplatLoader.SplatPackType?.Raw,
-        ),
-        new Promise((_, reject) =>
-          setTimeout(
-            () =>
-              reject(
-                new Error(
-                  "Parsing did not finish in 120s. The splat worker most likely " +
-                    "failed to start — check the browser console for a Worker or " +
-                    "SecurityError. A smaller preview (Max Gaussians in the export " +
-                    "tool) will confirm whether it is size-related.",
-                ),
-              ),
-            120000,
-          ),
-        ),
-      ]);
-      const splat = await SplatUtils.createSplat(data);
-      viewer.getScene().add(splat);
-      disposer.current = () => {
-        try {
-          viewer.destroy?.();
-        } catch {
-          /* engine already torn down */
-        }
-      };
-      setProgress("");
-    } catch (e) {
-      setError(String((e as Error).message || e));
-      setProgress("");
-    } finally {
-      setLoading(false);
-    }
-  }, [setError]);
+        setProgress("loading splat…");
+        await viewer.addSplatScene(
+          `/api/quality/preview.ply${small ? "?small=true" : ""}`,
+          {
+            // The query string defeats extension sniffing, so say it is a PLY.
+            format: GS.SceneFormat.Ply,
+            showLoadingUI: true,
+            progressiveLoad: true,
+          },
+        );
+        viewer.start();
+        disposer.current = () => viewer.dispose();
+        setProgress("");
+      } catch (e) {
+        setError(String((e as Error).message || e));
+        setProgress("");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [setError, status],
+  );
 
   if (!loaded) return <p className="text-ink-400">Open a project first.</p>;
 
@@ -125,9 +117,8 @@ export function PreviewPage() {
       <div>
         <h1 className="text-xl font-semibold">Preview</h1>
         <p className="mt-1 max-w-3xl text-sm text-ink-400">
-          The cleaned splat, in the browser, before any USD or Isaac step. Isaac
-          takes about 80 seconds to start and holds the GPU — which also stalls
-          training — so this is the faster way to judge a cleanup setting.
+          The cleaned splat, rendered by your browser — no Isaac, no USD build,
+          works remotely. Drag to orbit, right-drag to pan, scroll to zoom.
         </p>
       </div>
 
@@ -142,7 +133,7 @@ export function PreviewPage() {
         <button
           className="rounded border border-ink-700 px-3 py-1.5 hover:bg-ink-800 disabled:opacity-50"
           disabled={!status?.has_small || loading}
-          title="50k Gaussians — if this renders and the full one does not, the problem is size, not the file."
+          title="50k Gaussians — loads in seconds; use to sanity-check before the full scene."
           onClick={() => void show(true)}
         >
           Show small (50k)
@@ -172,7 +163,7 @@ export function PreviewPage() {
 
       <div
         ref={container}
-        className="h-[70vh] w-full rounded border border-ink-800 bg-black"
+        className="relative h-[70vh] w-full overflow-hidden rounded border border-ink-800 bg-black"
       />
     </div>
   );

@@ -2835,6 +2835,12 @@ TOOL_DEFS: list[dict[str, Any]] = [
                 path_kind="file", path_ext=".json", default_from="scene_manifest",
             ),
             _tool_opt(
+                "tool-export-splat-ply", "colmap", "COLMAP sparse dir", "path",
+                "sparse/0 with images.bin; used to start the browser camera at a "
+                "real capture pose inside the room.", None,
+                path_kind="dir", default_from="colmap_sparse_dir",
+            ),
+            _tool_opt(
                 "tool-export-splat-ply", "sh_degree", "Spherical harmonics degree", "int",
                 "0 keeps flat colour and is ~4x smaller to download; 3 keeps full "
                 "view-dependent colour.", 0, min=0, max=3, step=1, widget="slider",

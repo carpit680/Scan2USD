@@ -220,8 +220,10 @@ def preview_status() -> dict:
     path = Path(cfg.workspace_dir) / "build" / "visual" / "preview.ply"
     source = Path(cfg.workspace_dir) / "build" / "visual" / "environment_splat.usd"
     small = Path(cfg.workspace_dir) / "build" / "visual" / "preview_small.ply"
+    meta = _load(Path(cfg.workspace_dir) / "build" / "visual" / "preview_meta.json")
     exists = path.is_file()
     return {
+        "meta": meta,
         "has_small": small.is_file(),
         "small_bytes": small.stat().st_size if small.is_file() else 0,
         "exists": exists,

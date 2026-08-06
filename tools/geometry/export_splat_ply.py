@@ -126,6 +126,14 @@ def main() -> None:
         "preview is Z-up with the floor at zero, like the Isaac scene.",
     )
     parser.add_argument(
+        "--colmap",
+        type=Path,
+        default=None,
+        help="COLMAP sparse/0; when given, a preview_meta.json is written next "
+        "to the output with a starting camera taken from the real capture path, "
+        "so the browser viewer opens inside the room instead of at the origin.",
+    )
+    parser.add_argument(
         "--sh-degree",
         type=int,
         default=0,
@@ -211,6 +219,29 @@ def main() -> None:
         fields[f"rot_{index}"] = rotations[:, index]
 
     write_ply(args.out, fields)
+
+    if args.colmap is not None and (args.colmap / "images.bin").is_file():
+        from scan2usd.reconstruction.free_space import read_images_bin
+
+        centres = np.asarray(
+            list(read_images_bin(args.colmap / "images.bin").values()), dtype=np.float64
+        )
+        if transform is not None:
+            centres = centres @ transform[:3, :3].T + transform[:3, 3]
+        # A real capture pose partway along the path, looking at the centre of
+        # the path — the same "start inside the room" rule the Isaac viewer uses,
+        # because the reconstruction is only valid where the camera actually went.
+        start = centres[len(centres) // 2]
+        look = centres.mean(axis=0)
+        if np.linalg.norm(look - start) < 1e-6:
+            look = start + np.array([1.0, 0.0, 0.0])
+        meta = {
+            "camera_position": [round(float(v), 4) for v in start],
+            "look_at": [round(float(v), 4) for v in look],
+            "up": [0.0, 0.0, 1.0] if transform is not None else [0.0, -1.0, 0.0],
+        }
+        meta_path = args.out.with_name(args.out.stem + "_meta.json")
+        meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
     colour = 0.5 + SH_C0 * coefficients[:, 0, :]
     print(
