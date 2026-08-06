@@ -184,3 +184,48 @@ def get_quality() -> dict:
             "build_report": build_report is not None,
         },
     }
+
+
+@router.get("/preview.ply")
+def preview_ply():
+    """
+    Serve the browser-preview PLY, streamed so a 66 MB splat does not buffer.
+
+    Range requests matter here: the viewer asks for the header before the body,
+    and without them the whole file is refetched.
+    """
+    from fastapi.responses import FileResponse
+
+    try:
+        cfg = _cfg()
+    except FileNotFoundError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    path = Path(cfg.workspace_dir) / "build" / "visual" / "preview.ply"
+    if not path.is_file():
+        raise HTTPException(
+            404,
+            "No preview.ply yet — run the 'Export splat PLY' tool to build one "
+            "from the cleaned splat.",
+        )
+    return FileResponse(path, media_type="application/octet-stream", filename=path.name)
+
+
+@router.get("/preview-status")
+def preview_status() -> dict:
+    try:
+        cfg = _cfg()
+    except FileNotFoundError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    path = Path(cfg.workspace_dir) / "build" / "visual" / "preview.ply"
+    source = Path(cfg.workspace_dir) / "build" / "visual" / "environment_splat.usd"
+    exists = path.is_file()
+    return {
+        "exists": exists,
+        "path": str(path),
+        "bytes": path.stat().st_size if exists else 0,
+        # A preview older than the splat it came from is worse than none: it
+        # shows a cleanup setting you already changed.
+        "stale": bool(
+            exists and source.is_file() and source.stat().st_mtime > path.stat().st_mtime
+        ),
+    }

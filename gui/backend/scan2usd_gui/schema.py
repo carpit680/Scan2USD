@@ -757,14 +757,17 @@ CONFIG_PARAMS: list[dict[str, Any]] = [
         label="Opacity penalty",
         type="float",
         group="reconstruction",
-        default=0.01,
+        default=0.0005,
         config_path="reconstruction.anti_fog.lambda_opacity",
         min=0.0,
-        max=0.2,
-        step=0.005,
+        max=0.01,
+        step=0.0005,
         tooltip=(
-            "Weight on total opacity: a Gaussian must earn the light it blocks. Too "
-            "high eats translucent detail (curtains, lampshades), so start low."
+            "Weight on total opacity: a Gaussian must earn the light it blocks. "
+            "MEASURED: 0.01 collapsed the bedroom to ~8,000 Gaussians from 2.9M — "
+            "it drives opacities under the density-prune threshold as fast as "
+            "densification creates them, and the run still reports a healthy loss. "
+            "Stay near 0.0005 unless you have a replenishment mechanism."
         ),
     ),
     _p(
@@ -2776,6 +2779,52 @@ TOOL_DEFS: list[dict[str, Any]] = [
                 "int",
                 "Path-tracing subframes per view.",
                 24,
+            ),
+        ],
+    },
+    {
+        "id": "tool-export-splat-ply",
+        "label": "Export splat PLY (browser preview)",
+        "category": "tools",
+        "description": (
+            "Convert the cleaned ParticleField to a 3DGS PLY so the scene can be "
+            "checked in the browser Preview tab, without launching Isaac or "
+            "committing to a USD build."
+        ),
+        "guide_anchor": "tools",
+        "needs_config": True,
+        "job_kind": "tool",
+        "script": "tools/geometry/export_splat_ply.py",
+        "python_from": "isaac_python",
+        "options": [
+            _tool_opt(
+                "tool-export-splat-ply", "stage", "Splat USD", "path",
+                "Cleaned ParticleField USD to convert.", None,
+                required=True, path_kind="file", path_ext=".usd,.usda,.usdc",
+                default_from="environment_splat",
+            ),
+            _tool_opt(
+                "tool-export-splat-ply", "out", "Output PLY", "path",
+                "Where to write the preview. The Preview tab reads "
+                "<workspace>/build/visual/preview.ply.", None,
+                required=True, path_kind="file", path_ext=".ply",
+                default_from="preview_ply",
+            ),
+            _tool_opt(
+                "tool-export-splat-ply", "manifest", "Scene manifest", "path",
+                "Applies the COLMAP->USD transform so the preview is Z-up with the "
+                "floor at zero, matching what Isaac shows.", None,
+                path_kind="file", path_ext=".json", default_from="scene_manifest",
+            ),
+            _tool_opt(
+                "tool-export-splat-ply", "sh_degree", "Spherical harmonics degree", "int",
+                "0 keeps flat colour and is ~4x smaller to download; 3 keeps full "
+                "view-dependent colour.", 0, min=0, max=3, step=1, widget="slider",
+            ),
+            _tool_opt(
+                "tool-export-splat-ply", "max_gaussians", "Max Gaussians", "int",
+                "Randomly subsample for a lighter preview. 0 keeps all.", 0,
+                min=0, max=5000000, step=100000,
             ),
         ],
     },

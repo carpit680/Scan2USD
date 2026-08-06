@@ -56,8 +56,8 @@ reconstruction:
   grut_schedule_autofix: true
   densify_end_fraction: 0.5
   anti_fog:
-    enabled: true
-    lambda_opacity: 0.01
+    enabled: false
+    lambda_opacity: 0.0005
     prune_weight_threshold: 0.0
     prune_weight_frequency: 100
     prune_weight_start_fraction: 0.2

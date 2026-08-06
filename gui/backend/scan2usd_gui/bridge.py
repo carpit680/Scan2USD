@@ -224,6 +224,8 @@ def workspace_paths(cfg: SceneConfig, *, cwd: Path | None = None) -> dict[str, s
         "splat_cleanup_report": d(splat_parent / "splat_cleanup_report.json"),
         "splat_analysis_report": d(splat_parent / "splat_analysis.json"),
         "orbit_renders_dir": d(ws / "build" / "orbit_renders"),
+        "preview_ply": d(splat_parent / "preview.ply"),
+        "scene_manifest": d(ws / "scene_manifest.json"),
         "colmap_sparse_dir": d(Path(cfg.nerfstudio_data_dir) / "colmap" / "sparse" / "0"),
         "proposals_json": d(ws / "build" / "segmentation" / "proposals.json"),
         "segmentation_dir": d(ws / "build" / "segmentation"),

@@ -340,9 +340,13 @@ class AntiFogConfig:
     """
 
     enabled: bool = False
-    # L1 on total opacity: a Gaussian must earn the light it blocks. 0.01 is a
-    # starting point; the tuner sweeps it.
-    lambda_opacity: float = 0.01
+    # L1 on total opacity: a Gaussian must earn the light it blocks.
+    # MEASURED: 0.01 is catastrophic here. It pushes opacities below the 0.005
+    # density-prune threshold as fast as densification creates them, so the
+    # bedroom's 50k run never grew past ~8,000 Gaussians against 2.9M without it
+    # — a 340x collapse, and the run still reported a healthy loss. Anything
+    # above ~0.001 needs a replenishment mechanism (MCMC relocation) to survive.
+    lambda_opacity: float = 0.0005
     lambda_scale: float = 0.0
     # Accumulated-evidence pruning: drop Gaussians whose rolling render
     # contribution stays below this. INERT in the pinned 3DGRUT: its
@@ -359,7 +363,7 @@ class AntiFogConfig:
         raw = data or {}
         return cls(
             enabled=bool(raw.get("enabled", False)),
-            lambda_opacity=float(raw.get("lambda_opacity", 0.01)),
+            lambda_opacity=float(raw.get("lambda_opacity", 0.0005)),
             lambda_scale=float(raw.get("lambda_scale", 0.0)),
             prune_weight_threshold=float(raw.get("prune_weight_threshold", 0.0)),
             prune_weight_frequency=int(raw.get("prune_weight_frequency", 100)),

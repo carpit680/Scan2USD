@@ -165,6 +165,7 @@ export const client = {
   pipelineState: () => api<Record<string, unknown>>("/api/pipeline/state"),
   tuningTrials: () => api<Record<string, unknown>>("/api/tuning/trials"),
   quality: () => api<Record<string, unknown>>("/api/quality"),
+  previewStatus: () => api<Record<string, unknown>>("/api/quality/preview-status"),
   doctor: () => api<Record<string, unknown>>("/api/doctor"),
   guide: () =>
     api<{
