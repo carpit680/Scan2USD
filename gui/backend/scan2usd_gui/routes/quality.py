@@ -71,6 +71,7 @@ def get_quality() -> dict:
     analysis = _load(splat_dir / "splat_analysis.json")
     scene_quality = _load(build / "scene_quality.json") or _load(usd_dir / "scene_quality.json")
     build_report = _load(usd_dir / "build_report.json")
+    gate_report = _load(build / "quality_gates.json")
     baseline = _load(splat_dir / "baseline" / "scene_quality.json")
 
     fog = (cleanup or {}).get("fog_metrics") or {}
@@ -175,6 +176,7 @@ def get_quality() -> dict:
         "blocking": (analysis or {}).get("blocking_cross_section"),
         "baseline_score": (baseline or {}).get("quality_score"),
         "gates": (build_report or {}).get("checks"),
+        "quality_gates": (gate_report or {}).get("gates") or [],
         "usable": (build_report or {}).get("usable"),
         "warnings": warnings,
         "have": {
@@ -182,6 +184,7 @@ def get_quality() -> dict:
             "analysis": analysis is not None,
             "scene_quality": scene_quality is not None,
             "build_report": build_report is not None,
+            "quality_gates": gate_report is not None,
         },
     }
 

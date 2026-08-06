@@ -467,9 +467,71 @@ class PipelineOrchestrator:
             force=force,
             ready=lambda: self._baked_ready("root_usd"),
         )
+        self.run_quality_gates()
         self._save()
         if root is None:
             root_artifact = self.manifest.artifact("root_usd")
             assert root_artifact is not None
             return Path(root_artifact.path)
         return root
+
+    def run_quality_gates(self) -> dict:
+        """
+        Judge the artifacts this build produced, and say what to do about it.
+
+        Runs at the end rather than per stage because every gate reads a report
+        the stage already wrote, so nothing is recomputed and a build is never
+        blocked by measurement. Failures land in the manifest warnings and in
+        build/quality_gates.json, which the GUI's Quality page reads.
+
+        Deliberately non-blocking: the point is that a bad artifact stops being
+        *silent*, not that the build stops. A gate that halts a preview build
+        would get switched off within a day.
+        """
+        import json as _json
+
+        from scan2usd.eval.gates import (
+            check_floor,
+            check_fog,
+            check_mesh_sanity,
+            check_training_health,
+            summarize,
+        )
+
+        def _read(path: Path) -> dict | None:
+            try:
+                return _json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+            except (OSError, ValueError):
+                return None
+
+        build_dir = Path(self.cfg.workspace_dir) / "build"
+        cleanup = _read(build_dir / "visual" / "splat_cleanup_report.json")
+        mesh = _read(build_dir / "geometry" / "static_collision_report.json")
+        floor_artifact = self.manifest.artifact("floor_alignment")
+        floor = dict(floor_artifact.metadata) if floor_artifact else None
+
+        observed = None
+        if cleanup and (fog := cleanup.get("fog_metrics")):
+            span = fog.get("room_span")
+            if span:
+                observed = [float(span) / 3.0] * 3  # rough per-axis scale of the room
+
+        results = [
+            check_training_health(cleanup),
+            check_fog(cleanup),
+            check_mesh_sanity(mesh, observed_extents=observed),
+            check_floor(floor),
+        ]
+        payload = summarize(results)
+        out = build_dir / "quality_gates.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(_json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+        for result in results:
+            if result.status in {"fail", "warn"}:
+                message = f"[{result.status}] {result.name}: {result.summary}"
+                if result.recommendation:
+                    message += f" -> {result.recommendation}"
+                if message not in self.manifest.warnings:
+                    self.manifest.warnings.append(message)
+        return payload

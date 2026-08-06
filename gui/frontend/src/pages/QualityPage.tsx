@@ -11,7 +11,15 @@ interface Metric {
   note: string;
 }
 
+interface Gate {
+  name: string;
+  status: "pass" | "warn" | "fail" | "unknown";
+  summary: string;
+  recommendation: string;
+}
+
 interface QualityData {
+  quality_gates: Gate[];
   workspace: string;
   appearance: Metric[];
   clarity: Metric[];
@@ -135,6 +143,36 @@ export function QualityPage() {
           ))}
         </div>
       </section>
+
+      {data.quality_gates?.length ? (
+        <section>
+          <h2 className="mb-2 text-sm font-semibold uppercase tracking-wide text-ink-300">
+            Stage checks
+          </h2>
+          <div className="space-y-2">
+            {data.quality_gates
+              .filter((g) => g.status !== "pass")
+              .concat(data.quality_gates.filter((g) => g.status === "pass"))
+              .map((gate) => (
+                <div
+                  key={gate.name}
+                  className={`rounded border p-3 text-sm ${TONE[gate.status] ?? TONE.info}`}
+                >
+                  <div className="flex items-baseline gap-2">
+                    <span className="text-xs uppercase tracking-wide opacity-70">
+                      {gate.status}
+                    </span>
+                    <span className="font-medium">{gate.name.replace(/_/g, " ")}</span>
+                  </div>
+                  <p className="mt-1">{gate.summary}</p>
+                  {gate.recommendation ? (
+                    <p className="mt-1 text-xs opacity-80">{gate.recommendation}</p>
+                  ) : null}
+                </div>
+              ))}
+          </div>
+        </section>
+      ) : null}
 
       {removed.length ? (
         <section>

@@ -34,6 +34,7 @@ def test_missing_reports_report_absence_rather_than_zero(tmp_path):
         "analysis": False,
         "scene_quality": False,
         "build_report": False,
+        "quality_gates": False,
     }
     for metric in body["appearance"] + body["clarity"]:
         assert metric["value"] is None

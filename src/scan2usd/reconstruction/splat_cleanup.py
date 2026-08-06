@@ -100,6 +100,7 @@ class SplatCleanupReport:
     removed_needle: int = 0
     removed_visibility: int = 0
     removed_free_space: int = 0
+    free_space_breakdown: dict[str, Any] | None = None
     fog_metrics: dict[str, Any] | None = None
     free_space_error: str | None = None
     scene_diagonal: float | None = None
@@ -564,6 +565,7 @@ def cleanup_particlefield_file(
     loaded = _load_gaussian_arrays(prim)
 
     free_space_remove = None
+    carve_stats: dict[str, Any] | None = None
     fog_metrics: dict[str, Any] | None = None
     free_space_error: str | None = None
     carve = None
@@ -584,7 +586,7 @@ def cleanup_particlefield_file(
     if carve is not None and (params.free_space_votes > 0 or params.air_min_neighbors > 0):
         from scan2usd.reconstruction.free_space import free_space_removal_mask
 
-        free_space_remove, _carve_stats = free_space_removal_mask(
+        free_space_remove, carve_stats = free_space_removal_mask(
             loaded["positions"],
             carve,
             min_free_votes=params.free_space_votes,
@@ -678,6 +680,7 @@ def cleanup_particlefield_file(
         removed_needle=removed["removed_needle"],
         removed_visibility=removed["removed_visibility"],
         removed_free_space=removed["removed_free_space"],
+        free_space_breakdown=carve_stats,
         fog_metrics=fog_metrics,
         free_space_error=free_space_error,
         scene_diagonal=removed["scene_diagonal"],
