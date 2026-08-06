@@ -963,6 +963,41 @@ CONFIG_PARAMS: list[dict[str, Any]] = [
         ),
     ),
     _p(
+        id="reconstruction.splat_cleanup.air_min_neighbors",
+        label="Min neighbours in mid-air",
+        type="int",
+        group="reconstruction",
+        default=0,
+        config_path="reconstruction.splat_cleanup.air_min_neighbors",
+        min=0,
+        max=400,
+        step=10,
+        tooltip=(
+            "Delete Gaussians that are far from every reconstructed point AND have "
+            "fewer than this many neighbours. Reaches the haze that carving cannot "
+            "prove empty, because rays only travel toward tracked points and never "
+            "cross the air in front of a blank wall. A real surface the tracker "
+            "missed — a white ceiling — survives, because it is still a dense sheet "
+            "(median 687 neighbours here) while haze is diffuse (median 51). "
+            "80 measured on the bedroom; 0 disables."
+        ),
+        help_level="essential",
+        widget="slider",
+    ),
+    _p(
+        id="reconstruction.splat_cleanup.air_neighbor_radius_frac",
+        label="Mid-air neighbour radius",
+        type="float",
+        group="reconstruction",
+        default=0.01,
+        config_path="reconstruction.splat_cleanup.air_neighbor_radius_frac",
+        min=0.002,
+        max=0.05,
+        step=0.001,
+        tooltip="Radius for the mid-air neighbour count, as a fraction of the observed diagonal.",
+        help_level="advanced",
+    ),
+    _p(
         id="reconstruction.splat_cleanup.carve_resolution",
         label="Carve grid resolution",
         type="int",

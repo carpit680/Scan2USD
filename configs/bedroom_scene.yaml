@@ -52,6 +52,8 @@ reconstruction:
     max_needle_ratio: null
     min_view_count: 0
     free_space_votes: 3
+    air_min_neighbors: 80
+    air_neighbor_radius_frac: 0.01
 segmentation:
   proposal_model: yolov8s-worldv2.pt
   mask_model: sam2

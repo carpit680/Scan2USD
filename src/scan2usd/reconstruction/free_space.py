@@ -392,29 +392,68 @@ def free_space_removal_mask(
     *,
     min_free_votes: int = 3,
     surface_radius_frac: float = SURFACE_RADIUS_FRAC,
+    air_min_neighbors: int = 0,
+    air_neighbor_radius_frac: float = 0.01,
 ) -> tuple[np.ndarray, dict]:
     """
-    Mask of Gaussians to delete: carved-free volume, with no surface nearby.
+    Mask of Gaussians to delete: in the air, by two independent kinds of evidence.
 
-    Both conditions are required. A featureless white wall has few SfM points,
-    but there is nothing behind it to aim rays at either, so it fails the
-    carved-free test and is never mistaken for haze. The surface radius is
-    metric rather than voxel-based so the rule means the same thing at any grid
-    resolution.
+    Nothing near an SfM point is ever removed, which is what makes both rules
+    safe to apply at all.
+
+    1. **Carved free** — rays passed through the cell, so it is provably empty.
+       Airtight, but limited by where rays can go: they only travel toward SfM
+       points, so the volume in front of a textureless wall is never carved. On
+       the bedroom this leaves 20,609 haze Gaussians untouched.
+
+    2. **Sparse in the air** — far from any SfM point *and* with few neighbours.
+       This is what separates haze from a real surface the tracker missed. A
+       white ceiling produces almost no SfM points, so criterion 1's protection
+       does not cover it; but it is still a densely packed sheet (median 687
+       neighbours within 1% of the room) while haze is diffuse (median 51).
+
+    Measured on the bedroom, and worth recording because it inverts the obvious
+    guess: haze here is *flat discs*, not spikes. Its needle ratio (s2/s1) runs
+    lower than the surfaces' — 2.5 against 3.7 — so ``max_needle_ratio`` removes
+    more surface than haze at every threshold, which is exactly why applying it
+    globally cost 3-6 dB. Density is the axis that actually separates the two.
     """
     positions = np.asarray(positions, dtype=np.float64)
     grid = carve.grid
     in_grid = grid.contains(positions)
     voxel_of = grid.index_of(positions)
-    radius = float(surface_radius_frac) * float(
-        np.linalg.norm(carve.reference[1] - carve.reference[0])
-    )
+    span = float(np.linalg.norm(carve.reference[1] - carve.reference[0]))
+    radius = float(surface_radius_frac) * span
     near_surface = within_surface_radius(positions, carve.points, radius)
-    remove = in_grid & (carve.free[voxel_of] >= int(min_free_votes)) & ~near_surface
+
+    in_air = in_grid & ~near_surface
+    carved = in_air & (carve.free[voxel_of] >= int(min_free_votes))
+    remove = carved.copy()
+
+    sparse_removed = 0
+    if int(air_min_neighbors) > 0:
+        counts = _neighbor_counts(positions, float(air_neighbor_radius_frac) * span)
+        sparse = in_air & (counts < int(air_min_neighbors))
+        sparse_removed = int(np.count_nonzero(sparse & ~remove))
+        remove |= sparse
+
     return remove, {
         "removed_free_space": int(np.count_nonzero(remove)),
+        "removed_carved": int(np.count_nonzero(carved)),
+        "removed_sparse_air": sparse_removed,
+        # Zero by construction -- the rules exclude near-surface Gaussians. Kept
+        # in the report so a future change that breaks that shows up immediately.
         "free_space_surface_loss": int(np.count_nonzero(remove & near_surface)),
         "free_space_radius": radius,
         "free_space_voxel": float(grid.voxel),
         "free_space_votes": int(min_free_votes),
+        "air_min_neighbors": int(air_min_neighbors),
     }
+
+
+def _neighbor_counts(points: np.ndarray, radius: float) -> np.ndarray:
+    """Neighbours within ``radius`` per point, excluding self."""
+    from scipy.spatial import cKDTree
+
+    tree = cKDTree(points)
+    return np.asarray(tree.query_ball_point(points, radius, return_length=True)) - 1

@@ -55,6 +55,8 @@ def main() -> None:
     parser.add_argument("--carve-resolution", type=int, default=256)
     parser.add_argument("--carve-max-rays", type=int, default=400_000)
     parser.add_argument("--surface-radius-frac", type=float, default=0.015)
+    parser.add_argument("--air-min-neighbors", type=int, default=0)
+    parser.add_argument("--air-neighbor-radius-frac", type=float, default=0.01)
     parser.add_argument("--observed-min", type=float, nargs=3, default=None)
     parser.add_argument("--observed-max", type=float, nargs=3, default=None)
     parser.add_argument("--raw-backup", type=Path, default=None)
@@ -80,6 +82,8 @@ def main() -> None:
         carve_resolution=args.carve_resolution,
         carve_max_rays=args.carve_max_rays,
         surface_radius_frac=args.surface_radius_frac,
+        air_min_neighbors=args.air_min_neighbors,
+        air_neighbor_radius_frac=args.air_neighbor_radius_frac,
     )
     report = cleanup_particlefield_file(
         args.input,

@@ -261,6 +261,11 @@ class SplatCleanupConfig:
     # Gaussians within this fraction of the observed diagonal of an SfM point
     # are carrying a surface and are never removed by the carve.
     surface_radius_frac: float = 0.015
+    # Second, independent anti-haze rule: a Gaussian far from every SfM point
+    # AND with fewer than this many neighbours is diffuse haze, not a surface.
+    # Reaches what carving cannot prove empty. 0 disables.
+    air_min_neighbors: int = 0
+    air_neighbor_radius_frac: float = 0.01
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> SplatCleanupConfig:
@@ -285,6 +290,8 @@ class SplatCleanupConfig:
             carve_resolution=int(raw.get("carve_resolution", 256)),
             carve_max_rays=int(raw.get("carve_max_rays", 400_000)),
             surface_radius_frac=float(raw.get("surface_radius_frac", 0.015)),
+            air_min_neighbors=int(raw.get("air_min_neighbors", 0)),
+            air_neighbor_radius_frac=float(raw.get("air_neighbor_radius_frac", 0.01)),
         )
 
     def to_params(self):
@@ -307,6 +314,8 @@ class SplatCleanupConfig:
             carve_resolution=self.carve_resolution,
             carve_max_rays=self.carve_max_rays,
             surface_radius_frac=self.surface_radius_frac,
+            air_min_neighbors=self.air_min_neighbors,
+            air_neighbor_radius_frac=self.air_neighbor_radius_frac,
         )
 
 

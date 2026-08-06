@@ -68,6 +68,11 @@ class SplatCleanupParams:
     carve_resolution: int = 256
     carve_max_rays: int = 400_000
     surface_radius_frac: float = 0.015
+    # Independent of the carve: far from every SfM point AND locally sparse.
+    # Reaches the haze rays cannot prove empty; a real but untracked surface
+    # (a white ceiling) stays because it is still a densely packed sheet.
+    air_min_neighbors: int = 0
+    air_neighbor_radius_frac: float = 0.01
 
 
 @dataclass
@@ -569,7 +574,7 @@ def cleanup_particlefield_file(
             "carving skipped"
         )
 
-    if carve is not None and params.free_space_votes > 0:
+    if carve is not None and (params.free_space_votes > 0 or params.air_min_neighbors > 0):
         from scan2usd.reconstruction.free_space import free_space_removal_mask
 
         free_space_remove, _carve_stats = free_space_removal_mask(
@@ -577,6 +582,8 @@ def cleanup_particlefield_file(
             carve,
             min_free_votes=params.free_space_votes,
             surface_radius_frac=params.surface_radius_frac,
+            air_min_neighbors=params.air_min_neighbors,
+            air_neighbor_radius_frac=params.air_neighbor_radius_frac,
         )
 
     keep, removed = compute_keep_mask(
@@ -783,6 +790,10 @@ def cleanup_particlefield_via_isaac(
             str(params.carve_max_rays),
             "--surface-radius-frac",
             str(params.surface_radius_frac),
+            "--air-min-neighbors",
+            str(params.air_min_neighbors),
+            "--air-neighbor-radius-frac",
+            str(params.air_neighbor_radius_frac),
         ]
     )
     if params.max_needle_ratio is not None:
