@@ -21,6 +21,7 @@ from scan2usd_gui.routes import (
     pipeline,
     project,
     review,
+    quality,
     tuning,
 )
 
@@ -68,6 +69,7 @@ def create_app() -> FastAPI:
     app.include_router(guide.router)
     app.include_router(mobile.router)
     app.include_router(tuning.router)
+    app.include_router(quality.router)
 
     dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"
     if dist.is_dir():

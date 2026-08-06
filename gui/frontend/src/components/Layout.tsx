@@ -11,6 +11,7 @@ const NAV = [
   { to: "/commands", label: "Commands" },
   { to: "/review", label: "Review" },
   { to: "/metric", label: "Metric" },
+  { to: "/quality", label: "Quality" },
   { to: "/tuning", label: "Tuning" },
   { to: "/artifacts", label: "Artifacts" },
   { to: "/doctor", label: "Doctor" },
