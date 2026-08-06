@@ -42,6 +42,13 @@ from pathlib import Path
 
 import numpy as np
 
+# The analysis grid spans the observed volume padded by this fraction of its
+# extent — enough to cover wall thickness and the Gaussians just behind surfaces.
+OBSERVED_DILATION = 0.25
+# A Gaussian within this fraction of the observed diagonal of an SfM point is
+# carrying a surface. Resolution-independent, unlike voxel occupancy.
+SURFACE_RADIUS_FRAC = 0.015
+
 # ---------------------------------------------------------------- COLMAP (bin)
 
 
@@ -132,20 +139,64 @@ class Grid:
     dims: np.ndarray
 
     def index_of(self, points: np.ndarray) -> np.ndarray:
+        """Flat voxel index, clamped. Only meaningful where ``contains`` is true."""
         idx = np.floor((points - self.origin) / self.voxel).astype(np.int64)
         np.clip(idx, 0, self.dims - 1, out=idx)
         return idx[:, 0] * (self.dims[1] * self.dims[2]) + idx[:, 1] * self.dims[2] + idx[:, 2]
+
+    def contains(self, points: np.ndarray) -> np.ndarray:
+        idx = np.floor((points - self.origin) / self.voxel).astype(np.int64)
+        return np.all((idx >= 0) & (idx < self.dims), axis=1)
 
     @property
     def size(self) -> int:
         return int(np.prod(self.dims))
 
 
-def build_grid(points: np.ndarray, resolution: int) -> Grid:
+def observed_reference_bounds(points: np.ndarray, centres: np.ndarray) -> np.ndarray:
+    """
+    The volume actually captured, robust to COLMAP's outlier points.
+
+    Camera positions are the trustworthy part: they are where the operator
+    physically stood, and unlike triangulated points they have no long tail. On
+    the bedroom the camera bounds (7.9 x 10.4 x 5.5) match the 5-95 percentile
+    SfM extent (7.7 x 10.1 x 5.0) to within a few percent, while the 1-99
+    percentile still spans 69.7 on one axis and the raw min/max spans 170.
+    Sizing a grid off those tails makes every voxel 6x too coarse.
+
+    Union of the two so surfaces the cameras looked at are covered as well as
+    the volume they moved through.
+    """
+    lo_pts, hi_pts = np.percentile(points, [5, 95], axis=0)
+    lo = np.minimum(lo_pts, centres.min(axis=0))
+    hi = np.maximum(hi_pts, centres.max(axis=0))
+    return np.vstack([lo, hi])
+
+
+def build_grid(points: np.ndarray, resolution: int, *, dilation: float = 0.0) -> Grid:
+    """
+    Grid spanning ``points``, optionally padded by ``dilation`` of its extent.
+
+    Callers must pass a *stable reference* — the SfM points — not the Gaussians.
+    Sizing the grid to the Gaussians makes every number here incomparable
+    between two models of the same room: the bedroom's raw export spans 574
+    units because of a handful of stray Gaussians, giving a 1.36-unit voxel, so
+    the entire room interior collapses into 57 voxels and almost everything
+    lands in a voxel that happens to hold an SfM point. The cleaned model of the
+    same room, spanning 47 units, gets a 0.15-unit voxel and 48,832. Comparing
+    the two measures the grid, not the fog.
+    """
     lo = points.min(axis=0)
     hi = points.max(axis=0)
+    if dilation:
+        pad = (hi - lo) * float(dilation)
+        lo = lo - pad
+        hi = hi + pad
     voxel = float(np.max(hi - lo)) / float(resolution)
-    dims = np.maximum(np.ceil((hi - lo) / voxel).astype(np.int64), 1)
+    # One extra layer: a point exactly on the upper bound floors to index
+    # ceil(extent/voxel), which would otherwise be one past the last voxel and
+    # count as outside the volume it defines.
+    dims = np.maximum(np.ceil((hi - lo) / voxel).astype(np.int64), 1) + 1
     return Grid(origin=lo, voxel=voxel, dims=dims)
 
 
@@ -173,6 +224,12 @@ def carve_free_space(
     origins_arr = np.asarray(origins, dtype=np.float64)
     targets_arr = np.asarray(targets, dtype=np.float64)
 
+    # Rays aimed at COLMAP's outlier points leave the observed volume entirely;
+    # their samples would all be discarded anyway, and their length sets the
+    # step count for every chunk. Drop them before budgeting.
+    on_target = grid.contains(targets_arr)
+    origins_arr, targets_arr = origins_arr[on_target], targets_arr[on_target]
+
     total = len(origins_arr)
     if total > max_rays:
         pick = rng.choice(total, size=max_rays, replace=False)
@@ -182,7 +239,8 @@ def carve_free_space(
     free = np.zeros(grid.size, dtype=np.uint32)
     occupied = np.zeros(grid.size, dtype=np.uint32)
 
-    np.add.at(occupied, grid.index_of(points), 1)
+    in_grid = grid.contains(points)
+    np.add.at(occupied, grid.index_of(points[in_grid]), 1)
 
     direction = targets_arr - origins_arr
     lengths = np.linalg.norm(direction, axis=1)
@@ -206,6 +264,7 @@ def carve_free_space(
         frac = np.where(valid, t / length, 0.0)
         samples = o[:, None, :] + frac[:, :, None] * d[:, None, :]
         flat = samples.reshape(-1, 3)[valid.reshape(-1)]
+        flat = flat[grid.contains(flat)]  # never clamp a sample into an edge voxel
         if len(flat):
             # True ray-hit counts, so min_free_votes means "N rays passed through
             # here" rather than the meaningless "hit in N different chunks".
@@ -256,6 +315,23 @@ def _inside(hull, points: np.ndarray) -> np.ndarray:
         block = points[start : start + 200_000]
         inside[start : start + 200_000] = hull.find_simplex(block) >= 0
     return inside
+
+
+def within_surface_radius(
+    positions: np.ndarray, points: np.ndarray, radius: float
+) -> np.ndarray:
+    """Mask of Gaussians lying within ``radius`` of any SfM point."""
+    from scipy.spatial import cKDTree
+
+    if not len(points):
+        return np.zeros(len(positions), dtype=bool)
+    tree = cKDTree(points)
+    near = np.zeros(len(positions), dtype=bool)
+    for start in range(0, len(positions), 200_000):
+        block = positions[start : start + 200_000]
+        distance, _ = tree.query(block, k=1, distance_upper_bound=radius)
+        near[start : start + 200_000] = np.isfinite(distance)
+    return near
 
 
 def hull_voxel_indices(grid: Grid, centres: np.ndarray) -> np.ndarray:
@@ -322,6 +398,7 @@ def analyze(
     resolution: int,
     max_rays: int,
     min_free_votes: int,
+    surface_radius_frac: float = SURFACE_RADIUS_FRAC,
 ) -> dict:
     gaussians = load_gaussians(stage)
     positions = gaussians["positions"]
@@ -344,7 +421,11 @@ def analyze(
     scale_max = scales.max(axis=1) if scales.ndim == 2 else scales
     scale_min = scales.min(axis=1) if scales.ndim == 2 else scales
 
-    grid = build_grid(positions, resolution)
+    # Grid anchored to the observed volume, so voxel size is a property of the
+    # capture rather than of whichever model is being scored.
+    centre_array = np.asarray(list(centres.values()), dtype=np.float64)
+    reference = observed_reference_bounds(points, centre_array)
+    grid = build_grid(reference, resolution, dilation=OBSERVED_DILATION)
     free, occupied = carve_free_space(
         grid,
         centres,
@@ -355,9 +436,26 @@ def analyze(
     )
 
     voxel_of = grid.index_of(positions)
-    is_occupied = occupied[voxel_of] > 0
-    is_free = (free[voxel_of] >= min_free_votes) & ~is_occupied
-    is_unobserved = ~is_occupied & ~is_free
+    in_grid = grid.contains(positions)
+    # Beyond the observed volume entirely — the exterior halo. Counted, but kept
+    # out of every interior statistic; nobody stands out there.
+    is_outside = ~in_grid
+
+    # "On a surface" is a metric question, not a voxel one. Defining it as
+    # "shares a voxel with an SfM point" makes the answer track the grid: at
+    # 0.35-unit voxels 82% of the bedroom reads as surface, at 0.06-unit voxels
+    # only 71% does, because SfM points are sparser than a fine grid. A fixed
+    # radius is stable under any resolution.
+    surface_radius = surface_radius_frac * float(np.linalg.norm(reference[1] - reference[0]))
+    near_surface = within_surface_radius(positions, points, surface_radius)
+
+    is_surface = in_grid & near_surface
+    carved_free = in_grid & (free[voxel_of] >= min_free_votes)
+    # Fog needs both: the cameras saw through here, AND no surface is near. A
+    # featureless white wall has few SfM points, but nothing is behind it to aim
+    # rays at either, so it fails the first test and is never called fog.
+    is_free = carved_free & ~near_surface
+    is_unobserved = in_grid & ~near_surface & ~carved_free
 
     # Blocking cross-section: what a Gaussian actually hides from a viewer.
     cross_section = opacities * np.pi * scale_mid**2
@@ -385,9 +483,10 @@ def analyze(
     # not a surface is what makes the room look cloudy from the inside; the halo
     # outside the walls is a separate problem and must not be averaged in.
     centre_array = np.asarray(list(centres.values()), dtype=np.float64)
-    in_hull = inside_camera_hull(positions, centre_array)
+    in_hull = inside_camera_hull(positions, centre_array) & in_grid
     hull_voxels = hull_voxel_indices(grid, centre_array)
-    hull_fog = in_hull & ~is_occupied
+    hull_fog = in_hull & is_free
+    hull_unsupported = in_hull & ~near_surface
     hull_sigma = extinction(hull_fog, hull_voxels)
 
     # Robust span: raw COLMAP min/max includes a few wildly misplaced points, so
@@ -405,24 +504,31 @@ def analyze(
         "bounds_max": positions.max(axis=0).tolist(),
         "extents": extents.tolist(),
         "diagonal": diagonal,
+        # Grid geometry is fixed by the capture, not the model, so these are
+        # identical for every model of this scene and the numbers are comparable.
         "voxel": grid.voxel,
         "grid_dims": grid.dims.tolist(),
+        "grid_origin": grid.origin.tolist(),
+        "observed_dilation": OBSERVED_DILATION,
         "cameras": len(centres),
         "sfm_points": int(len(points)),
         "opacity": percentiles(opacities),
         "scale_mid": percentiles(scale_mid),
         "anisotropy": percentiles(scale_max / np.maximum(scale_min, 1e-9)),
         "population": {
-            "surface": int(np.count_nonzero(is_occupied)),
+            "surface": int(np.count_nonzero(is_surface)),
             "free_space": int(np.count_nonzero(is_free)),
             "unobserved": int(np.count_nonzero(is_unobserved)),
+            "outside_observed": int(np.count_nonzero(is_outside)),
             "free_space_fraction": float(np.count_nonzero(is_free) / len(positions)),
+            "outside_observed_fraction": float(np.count_nonzero(is_outside) / len(positions)),
         },
         "blocking_cross_section": {
             "total": float(cross_section.sum()),
-            "surface": float(cross_section[is_occupied].sum()),
+            "surface": float(cross_section[is_surface].sum()),
             "free_space": float(cross_section[is_free].sum()),
             "unobserved": float(cross_section[is_unobserved].sum()),
+            "outside_observed": float(cross_section[is_outside].sum()),
             "free_space_fraction": float(
                 cross_section[is_free].sum() / max(cross_section.sum(), 1e-12)
             ),
@@ -437,12 +543,16 @@ def analyze(
             "fog_cross_section_fraction": float(
                 cross_section[hull_fog].sum() / max(cross_section.sum(), 1e-12)
             ),
+            # Upper bound: everything in there with no surface nearby, whether or
+            # not a ray happened to carve its voxel. fog_inside is the actionable
+            # subset — what a free-space filter could defensibly delete.
+            "unsupported_inside": int(np.count_nonzero(hull_unsupported)),
             "camera_span": camera_span,
         },
         "extinction_per_unit": {
             "carved_free_space": fog_sigma,
             "camera_hull_fog": hull_sigma,
-            "surface": extinction(is_occupied, occupied_voxels),
+            "surface": extinction(is_surface, occupied_voxels),
         },
         "visibility": {
             # What a viewer standing in the room actually loses to haze.
@@ -464,20 +574,20 @@ def analyze(
                 "removed": int(np.count_nonzero(rule)),
                 "removed_fraction": float(np.count_nonzero(rule) / len(positions)),
                 "removed_inside_hull": int(np.count_nonzero(rule & in_hull)),
-                "surface_loss": int(np.count_nonzero(rule & is_occupied)),
+                "surface_loss": int(np.count_nonzero(rule & near_surface)),
                 "cross_section_removed_fraction": float(
                     cross_section[rule].sum() / max(cross_section.sum(), 1e-12)
                 ),
             }
             for votes in (1, 3, 10, 30, 100)
-            for rule in [(free[voxel_of] >= votes) & ~is_occupied]
+            for rule in [in_grid & (free[voxel_of] >= votes) & ~near_surface]
         ],
         "surface_population_stats": {
-            "opacity": percentiles(opacities[is_occupied]) if np.any(is_occupied) else {},
-            "scale_mid": percentiles(scale_mid[is_occupied]) if np.any(is_occupied) else {},
+            "opacity": percentiles(opacities[is_surface]) if np.any(is_surface) else {},
+            "scale_mid": percentiles(scale_mid[is_surface]) if np.any(is_surface) else {},
             "anisotropy": (
-                percentiles((scale_max / np.maximum(scale_min, 1e-9))[is_occupied])
-                if np.any(is_occupied)
+                percentiles((scale_max / np.maximum(scale_min, 1e-9))[is_surface])
+                if np.any(is_surface)
                 else {}
             ),
         },
@@ -502,6 +612,7 @@ def main() -> None:
     parser.add_argument("--resolution", type=int, default=256)
     parser.add_argument("--max-rays", type=int, default=400_000)
     parser.add_argument("--min-free-votes", type=int, default=3)
+    parser.add_argument("--surface-radius-frac", type=float, default=SURFACE_RADIUS_FRAC)
     args = parser.parse_args()
 
     report = analyze(
@@ -510,6 +621,7 @@ def main() -> None:
         resolution=args.resolution,
         max_rays=args.max_rays,
         min_free_votes=args.min_free_votes,
+        surface_radius_frac=args.surface_radius_frac,
     )
     text = json.dumps(report, indent=2)
     if args.out:
@@ -525,8 +637,9 @@ def main() -> None:
         "\n"
         f"  Surface / free / unobserved : {pop['surface']:,} / {pop['free_space']:,} / "
         f"{pop['unobserved']:,}\n"
-        f"  Blocking mass, unobserved   : "
-        f"{mass['unobserved'] / max(mass['total'], 1e-9) * 100:.1f}%\n"
+        f"  Outside observed volume     : {pop['outside_observed']:,} "
+        f"({pop['outside_observed_fraction'] * 100:.1f}%), "
+        f"{mass['outside_observed'] / max(mass['total'], 1e-9) * 100:.1f}% of blocking mass\n"
         f"  Fog inside the camera path  : {hull['fog_inside']:,} Gaussians "
         f"({hull['fog_fraction_of_inside'] * 100:.1f}% of what is in there)\n"
         f"  Seen across the camera path : "

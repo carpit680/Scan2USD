@@ -109,3 +109,36 @@ def test_a_perfectly_level_camera_path_still_produces_a_hull():
         np.array([[0.0, 0.0, 1.5], [10.0, 10.0, 1.5]]), level
     )
     assert inside[0] and not inside[1]
+
+
+def test_grid_is_fixed_by_the_capture_not_the_model():
+    """
+    Two models of the same room must get the same grid.
+
+    Sizing the grid to the Gaussians made every fog number incomparable between
+    models: the bedroom's raw export spans 574 units because of a few strays,
+    giving a 1.36-unit voxel and a 57-voxel camera hull, while the cleaned model
+    of the same room gave 0.15 and 48,832. Comparing those measured the grid.
+    """
+    rng = np.random.default_rng(7)
+    wall, _ = _box_room(rng)
+    reference = np.percentile(wall, [1, 99], axis=0)
+
+    tight = analyze_splat.build_grid(reference, 64, dilation=0.15)
+    # Same capture, but a model carrying a few far-flung stray Gaussians.
+    strays = np.vstack([wall, [[500.0, 500.0, 500.0]]])
+    still_reference = np.percentile(strays, [1, 99], axis=0)
+    loose = analyze_splat.build_grid(still_reference, 64, dilation=0.15)
+
+    assert tight.voxel == pytest.approx(loose.voxel, rel=0.05)
+    assert tight.dims.tolist() == loose.dims.tolist()
+
+
+def test_points_outside_the_grid_are_excluded_not_clamped():
+    """A stray Gaussian must not be filed into an edge voxel as if observed."""
+    rng = np.random.default_rng(8)
+    wall, _ = _box_room(rng)
+    grid = analyze_splat.build_grid(np.percentile(wall, [1, 99], axis=0), 48)
+    probes = np.array([[0.0, 0.0, 1.5], [900.0, 900.0, 900.0]])
+    inside = grid.contains(probes)
+    assert inside[0] and not inside[1]

@@ -144,6 +144,16 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=0, help="Override render width")
     parser.add_argument("--height", type=int, default=0, help="Override render height")
     parser.add_argument(
+        "--max-dim",
+        type=int,
+        default=1920,
+        help=(
+            "Cap the render's longest side. Capture intrinsics can be 4K, and a "
+            "3840x2160 render product silently yields all-black frames on an 8 GB "
+            "card. Metrics resize to the reference anyway. 0 disables the cap."
+        ),
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=0,
@@ -216,6 +226,15 @@ def main() -> None:
         intrinsics = cameras[first["camera_id"]]
         width = args.width or intrinsics["width"]
         height = args.height or intrinsics["height"]
+        if args.max_dim and max(width, height) > args.max_dim:
+            shrink = args.max_dim / float(max(width, height))
+            width = max(1, int(round(width * shrink)))
+            height = max(1, int(round(height * shrink)))
+            print(
+                f"Render capped to {width}x{height} "
+                f"(capture intrinsics are {intrinsics['width']}x{intrinsics['height']}).",
+                flush=True,
+            )
         focal = 10.0
         h_aperture = focal * intrinsics["width"] / intrinsics["fx"]
         v_aperture = focal * intrinsics["height"] / intrinsics["fy"]
@@ -258,6 +277,17 @@ def main() -> None:
             if image.ndim != 3 or image.shape[0] == 0:
                 report["errors"].append(
                     f"{name}: annotator returned no image (shape={getattr(image, 'shape', None)})"
+                )
+                continue
+            # A render product the GPU could not service comes back as a valid
+            # array of zeros rather than an error. Scoring those produced a
+            # confident-looking 3.79/100 for a scene that renders fine at a
+            # smaller size, so refuse to write a frame with no image in it.
+            if float(np.asarray(image[..., :3]).std()) < 1e-6:
+                report["errors"].append(
+                    f"{name}: render is uniform (mean="
+                    f"{float(np.asarray(image[..., :3]).mean()):.1f}) — the render "
+                    "product returned an empty buffer; try a smaller --max-dim"
                 )
                 continue
             out_path = args.output / f"{Path(name).stem}.png"
