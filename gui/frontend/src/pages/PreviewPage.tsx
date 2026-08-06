@@ -66,13 +66,28 @@ export function PreviewPage() {
       try {
         const GS = await import("@mkkellogg/gaussian-splats-3d");
 
-        await disposer.current?.();
+        // Tear down the previous viewer best-effort. dispose() removes its own
+        // DOM nodes, and racing it against clearing the container throws
+        // "removeChild: not a child" — so swallow that class of failure and
+        // clear whatever it left behind afterwards.
+        try {
+          await disposer.current?.();
+        } catch {
+          /* the old viewer's DOM is going away regardless */
+        }
         disposer.current = null;
         container.current.innerHTML = "";
+        // Each viewer gets its own mount node, so its internal removals can
+        // never collide with a sibling's.
+        const mount = document.createElement("div");
+        mount.style.width = "100%";
+        mount.style.height = "100%";
+        mount.style.position = "relative";
+        container.current.appendChild(mount);
 
         const meta = status?.meta;
         const viewer = new GS.Viewer({
-          rootElement: container.current,
+          rootElement: mount,
           // The export applies the floor transform, so the scene is Z-up.
           cameraUp: meta?.up ?? [0, 0, 1],
           // A real capture pose partway along the path: the reconstruction is
@@ -96,7 +111,13 @@ export function PreviewPage() {
           },
         );
         viewer.start();
-        disposer.current = () => viewer.dispose();
+        disposer.current = async () => {
+          try {
+            await viewer.dispose();
+          } finally {
+            mount.remove();
+          }
+        };
         setProgress("");
       } catch (e) {
         setError(String((e as Error).message || e));
