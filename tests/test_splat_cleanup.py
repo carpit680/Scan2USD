@@ -244,3 +244,31 @@ def test_cleanup_refuses_to_gut_the_scene():
     assert keep.sum() == 10  # the mask itself is correct
     # The guard lives in the file-level path; check the params carry it.
     assert SplatCleanupParams().min_keep_fraction == 0.05
+
+
+def test_every_free_space_rule_can_trigger_the_carve_alone():
+    """
+    hull_air used to be missing from the trigger condition, so enabling it by
+    itself silently did nothing. The tuner caught it: a trial with
+    free_space_votes=0 and hull_air on reported 5.7% transmittance, i.e. the
+    rule had not run.
+    """
+    from scan2usd.reconstruction.splat_cleanup import SplatCleanupParams
+
+    for kwargs in (
+        {"free_space_votes": 3},
+        {"air_min_neighbors": 80},
+        {"hull_air": True},
+    ):
+        params = SplatCleanupParams(**kwargs)
+        wants = (
+            params.free_space_votes > 0
+            or params.air_min_neighbors > 0
+            or params.hull_air
+        )
+        assert wants, f"{kwargs} should trigger the carve"
+    assert not (
+        SplatCleanupParams().free_space_votes > 0
+        or SplatCleanupParams().air_min_neighbors > 0
+        or SplatCleanupParams().hull_air
+    )

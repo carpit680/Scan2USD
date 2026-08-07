@@ -583,7 +583,14 @@ def cleanup_particlefield_file(
             "carving skipped"
         )
 
-    if carve is not None and (params.free_space_votes > 0 or params.air_min_neighbors > 0):
+    # Every free-space rule must be able to trigger the carve on its own.
+    # hull_air was missing here, so setting it alone did nothing at all — the
+    # tuner surfaced this by scoring free_space_votes=0 at 5.7% transmittance
+    # while hull_air was supposedly enabled.
+    wants_carve = (
+        params.free_space_votes > 0 or params.air_min_neighbors > 0 or params.hull_air
+    )
+    if carve is not None and wants_carve:
         from scan2usd.reconstruction.free_space import free_space_removal_mask
 
         free_space_remove, carve_stats = free_space_removal_mask(

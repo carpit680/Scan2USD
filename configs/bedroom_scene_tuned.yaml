@@ -1,3 +1,4 @@
+# Auto-tuned from bedroom_scene.yaml: best trial cheap_005 (quality_score=65.686).
 name: bedroom
 video_path: /home/arpit/Scan2USD/workspace_bedroom/uploads/bedroom_scene.MOV
 workspace_dir: workspace_bedroom
@@ -41,7 +42,7 @@ reconstruction:
   usd_splat_format: standard
   splat_cleanup:
     enabled: true
-    outlier_std: 8
+    outlier_std: 6.0
     min_opacity: 0.01
     max_scale: null
     max_scale_frac: 0.08
