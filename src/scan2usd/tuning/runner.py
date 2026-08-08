@@ -385,9 +385,23 @@ class SceneTuner:
             recon["grut_max_iterations"] = self.cfg.reconstruction.grut_max_iterations
             recon["grut_overrides"] = list(self.cfg.reconstruction.grut_overrides)
         output = self.config_path.with_name(f"{self.config_path.stem}_tuned.yaml")
+        # This file is a full snapshot of the source config, not a patch, so it
+        # rots as the source moves on. A kitchen_scene_tuned.yaml written in July
+        # still carried the CPU COLMAP path and none of the halo filters added a
+        # few hours later; running it would have been a 69x slower reconstruction
+        # with worse cleanup, for a win of 0.014 quality points. Record what it
+        # was cut from so that is checkable.
+        import hashlib
+
+        source_text = self.config_path.read_text(encoding="utf-8")
+        digest = hashlib.sha256(source_text.encode()).hexdigest()[:12]
         header = (
             f"# Auto-tuned from {self.config_path.name}: best trial {best.trial_id} "
             f"(quality_score={best.quality_score}).\n"
+            f"# Snapshot of {self.config_path.name}@{digest} — everything outside\n"
+            "# the tuned parameters is frozen at that revision and will not pick up\n"
+            "# later edits. Re-run `scan2usd tune` after changing the source, or\n"
+            "# copy the winning parameters back and delete this file.\n"
         )
         output.write_text(
             header + yaml.safe_dump(raw, sort_keys=False), encoding="utf-8"
