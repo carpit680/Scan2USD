@@ -34,7 +34,9 @@ Quality/tuning additions (2026-07-26)
   cameras → PSNR/SSIM/LPIPS vs real frames → ``usd/scene_quality.json``.
 - ``scan2usd tune`` + GUI **Tuning** page — cheap splat-cleanup sweeps and
   opt-in 3DGRUT retrain trials optimizing ``quality_score``; winner promoted
-  to ``<config>_tuned.yaml``. ``configs/golden_scene.yaml`` is the seed profile.
+  to ``<config>_tuned.yaml`` (a full snapshot, so it goes stale as its source
+  moves on — the header records the source hash). ``configs/bedroom_scene.yaml``
+  is the most measured profile; there is no golden one yet.
 - Correctness: baked meshes now carry ``transform_hash`` (auto re-bake when
   floor/metric transform changes — the desk scan's 0.23 m registration error
   came from a stale bake); floor RANSAC rejects planes below

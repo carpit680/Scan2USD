@@ -197,9 +197,9 @@ the real frames**:
 
 ```bash
 # Render held-out views headlessly in Isaac and score PSNR/SSIM/LPIPS.
-scan2usd render-heldout configs/golden_scene.yaml
+scan2usd render-heldout configs/bedroom_scene.yaml
 # Re-aggregate scene_quality.json without re-rendering.
-scan2usd quality-report configs/golden_scene.yaml
+scan2usd quality-report configs/bedroom_scene.yaml
 ```
 
 Camera poses/intrinsics come from the COLMAP TXT model (same raw COLMAP frame as
@@ -213,8 +213,8 @@ automatically.
 **Auto-tuner** (`scan2usd tune`, or the GUI **Tuning** page):
 
 ```bash
-scan2usd tune configs/golden_scene.yaml                      # cheap loop only
-scan2usd tune configs/golden_scene.yaml --retrain-trials 2   # + 3DGRUT retrains
+scan2usd tune configs/bedroom_scene.yaml                     # cheap loop only
+scan2usd tune configs/bedroom_scene.yaml --retrain-trials 2   # + 3DGRUT retrains
 ```
 
 - *Cheap loop*: sweeps `splat_cleanup` thresholds by re-cleaning from
@@ -225,9 +225,13 @@ scan2usd tune configs/golden_scene.yaml --retrain-trials 2   # + 3DGRUT retrains
   `<config>_tuned.yaml` (`--no-promote` to skip). Budgets/spaces live under the
   `tuning:` YAML section.
 
-`configs/golden_scene.yaml` is the annotated best-practices profile and the
-recommended tuner seed. For maximum photorealism with no manipulable objects,
-it sets `segmentation.allow_no_objects: true` (nothing is masked out of the splat).
+There is no "golden" profile yet. One existed, wired to the desk capture that
+COLMAP registered 2 frames of out of 113, so it could not be run at all — a
+best-practices config that fails on its own scene teaches the wrong thing.
+`configs/bedroom_scene.yaml` is the most measured profile at present and is the
+better place to copy settings from; its comments record what each value cost or
+bought. For maximum photorealism with no manipulable objects, set
+`segmentation.allow_no_objects: true` so nothing is masked out of the splat.
 
 ### Validation
 
