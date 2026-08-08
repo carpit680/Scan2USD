@@ -47,8 +47,15 @@ export function PreviewPage() {
     }
   }, [setError]);
 
+  // Poll rather than making the reader press a button. The status is a stat()
+  // on two files, and the flag it drives — "stale" — is only useful if it
+  // clears itself when a rebuild finishes. Requiring a click to find out
+  // whether what you are looking at is current defeats the point of the flag.
   useEffect(() => {
-    if (loaded) void refresh();
+    if (!loaded) return;
+    void refresh();
+    const timer = setInterval(() => void refresh(), 3000);
+    return () => clearInterval(timer);
   }, [loaded, refresh]);
 
   useEffect(
@@ -165,9 +172,6 @@ export function PreviewPage() {
         >
           {status?.exists ? "Rebuild preview" : "Build preview"}
         </button>
-        <button className="text-xs text-ink-400 underline" onClick={() => void refresh()}>
-          refresh status
-        </button>
         {status?.exists ? (
           <span className="text-xs text-ink-500">{mb} MB</span>
         ) : (
@@ -177,9 +181,11 @@ export function PreviewPage() {
         )}
         {status?.stale ? (
           <span className="rounded border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-xs text-amber-400">
-            stale — the splat changed since this was built
+            stale — the splat changed since this was built; rebuild to see it
           </span>
-        ) : null}
+        ) : (
+          <span className="text-xs text-emerald-500/80">up to date</span>
+        )}
       </div>
 
       <div

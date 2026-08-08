@@ -84,3 +84,28 @@ def test_unit_scale_is_flagged_because_rl_needs_metres(tmp_path):
     project_state.set_project(config, cwd=tmp_path)
     body = TestClient(create_app()).get("/api/quality").json()
     assert any("not metric" in w for w in body["warnings"])
+
+
+def test_stale_covers_the_small_preview_too(tmp_path):
+    """
+    Only the full preview was checked, so "Show small" could serve a model from
+    before the last cleanup with nothing on screen saying so.
+    """
+    import os
+    import time
+
+    workspace = tmp_path / "ws"
+    visual = workspace / "build" / "visual"
+    visual.mkdir(parents=True)
+    (visual / "preview_small.ply").write_bytes(b"old")
+    time.sleep(0.01)
+    (visual / "environment_splat.usd").write_bytes(b"splat")
+    time.sleep(0.01)
+    (visual / "preview.ply").write_bytes(b"new")  # full one IS current
+
+    config = tmp_path / "scene.yaml"
+    config.write_text(yaml.safe_dump({"name": "t", "workspace_dir": str(workspace)}))
+    project_state.set_project(config, cwd=tmp_path)
+    body = TestClient(create_app()).get("/api/quality/preview-status").json()
+    assert body["stale"] is True, "an outdated small preview must still read as stale"
+    assert os.path.exists(visual / "preview.ply")

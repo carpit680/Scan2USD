@@ -141,6 +141,14 @@ def main() -> None:
         "full view-dependent colour and quadruples the download.",
     )
     parser.add_argument(
+        "--small-count",
+        type=int,
+        default=50_000,
+        help="Also write a subsampled <out>_small.ply for a fast sanity check. "
+        "Written from the same source in the same run, so the two can never "
+        "disagree about which model they show. 0 skips it.",
+    )
+    parser.add_argument(
         "--max-gaussians",
         type=int,
         default=0,
@@ -243,6 +251,16 @@ def main() -> None:
         meta_path = args.out.with_name(args.out.stem + "_meta.json")
         meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
+    # Same source, same run: a small preview built separately drifts out of date
+    # silently, and the staleness check only ever watched the full one.
+    small_written = None
+    if args.small_count and not args.max_gaussians and count > args.small_count:
+        pick = np.random.default_rng(0).choice(count, size=args.small_count, replace=False)
+        pick.sort()
+        small_path = args.out.with_name(args.out.stem + "_small" + args.out.suffix)
+        write_ply(small_path, {name: values[pick] for name, values in fields.items()})
+        small_written = str(small_path)
+
     colour = 0.5 + SH_C0 * coefficients[:, 0, :]
     print(
         json.dumps(
@@ -251,6 +269,7 @@ def main() -> None:
                 "sh_degree": int(np.sqrt(keep + 1) - 1) if keep else 0,
                 "bytes": args.out.stat().st_size,
                 "output": str(args.out.resolve()),
+                "small_output": small_written,
                 # A plausible room is mostly mid-tone. Far outside 0..1 means the
                 # DC coefficients were not what this assumed.
                 "implied_rgb_p5_p95": [

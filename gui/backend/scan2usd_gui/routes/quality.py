@@ -233,8 +233,13 @@ def preview_status() -> dict:
         "path": str(path),
         "bytes": path.stat().st_size if exists else 0,
         # A preview older than the splat it came from is worse than none: it
-        # shows a cleanup setting you already changed.
+        # shows a cleanup setting you already changed. Both files count — the
+        # small one used to drift silently because only the full one was checked.
         "stale": bool(
-            exists and source.is_file() and source.stat().st_mtime > path.stat().st_mtime
+            source.is_file()
+            and any(
+                candidate.is_file() and source.stat().st_mtime > candidate.stat().st_mtime
+                for candidate in (path, small)
+            )
         ),
     }
