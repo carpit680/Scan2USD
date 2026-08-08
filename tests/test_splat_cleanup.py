@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from scan2usd.reconstruction.splat_cleanup import (
     compute_keep_mask,
@@ -272,3 +273,51 @@ def test_every_free_space_rule_can_trigger_the_carve_alone():
         or SplatCleanupParams().air_min_neighbors > 0
         or SplatCleanupParams().hull_air
     )
+
+
+def test_vt_conversion_preserves_quaternion_component_order():
+    """
+    The trap in the fast path.
+
+    Vt arrays support the buffer protocol, so np.asarray reads them without a
+    Python loop — ~333,000x faster, and the difference between a 50-second splat
+    load and a 0.15-second one. But np.asarray on a Vt.QuatfArray yields
+    (x, y, z, w), imaginary first, while this module and the 3DGS PLY convention
+    both expect (w, x, y, z). Taking the fast path without rolling the columns
+    rotates every Gaussian, and the result still loads, renders and exports.
+    """
+    pytest.importorskip("pxr")
+    import numpy as np
+    from pxr import Gf, Vt
+
+    from scan2usd.reconstruction.splat_cleanup import _vt_to_numpy
+
+    quats = Vt.QuatfArray(
+        [Gf.Quatf(0.1, Gf.Vec3f(0.2, 0.3, 0.4)), Gf.Quatf(0.5, Gf.Vec3f(0.6, 0.7, 0.8))]
+    )
+    expected = np.asarray(
+        [[float(q.GetReal()), *[float(v) for v in q.GetImaginary()]] for q in quats]
+    )
+    assert np.allclose(_vt_to_numpy(quats), expected)
+    # Explicitly: real part first, not last.
+    assert _vt_to_numpy(quats)[0][0] == pytest.approx(0.1)
+
+
+def test_vt_conversion_matches_the_elementwise_form(monkeypatch):
+    """Vec3 and scalar arrays must be identical to the per-element conversion."""
+    pytest.importorskip("pxr")
+    import numpy as np
+    from pxr import Vt
+
+    from scan2usd.reconstruction.splat_cleanup import _vt_to_numpy
+
+    rng = np.random.default_rng(0)
+    vec = Vt.Vec3fArray.FromNumpy(rng.random((500, 3)).astype(np.float32))
+    scalar = Vt.FloatArray.FromNumpy(rng.random(500).astype(np.float32))
+
+    assert np.allclose(
+        _vt_to_numpy(vec), np.asarray([[float(x) for x in item] for item in vec])
+    )
+    assert np.allclose(_vt_to_numpy(scalar), np.asarray([float(x) for x in scalar]))
+    assert _vt_to_numpy(vec).dtype == np.float64
+    assert _vt_to_numpy(Vt.Vec3fArray()).shape == (0, 3)
