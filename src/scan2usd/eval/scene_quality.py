@@ -175,6 +175,15 @@ def build_scene_quality_report(
             "mean_lpips": photorealism.get("mean_lpips") if photorealism else None,
             "evaluated_views": photorealism.get("evaluated") if photorealism else 0,
             "expected_views": photorealism.get("expected") if photorealism else 0,
+            # Which resolution the comparison ran at. Scores from the two modes
+            # are not interchangeable: on the same renders, switching from
+            # "reference" to "render" left PSNR unmoved (18.87 -> 18.89) but
+            # moved SSIM 0.798 -> 0.741, because upsampling the render used to
+            # blur both images toward each other in exactly the flat regions
+            # SSIM weights most. Any comparison across modes is meaningless.
+            "eval_resolution": (
+                photorealism.get("eval_resolution") if photorealism else None
+            ),
             "render_dir": str(render_dir.resolve()) if render_dir.is_dir() else None,
             "note": (
                 "Isaac RTX renders at held-out capture cameras vs real frames. "
