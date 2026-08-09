@@ -352,15 +352,97 @@ class CarveResult:
     reference: np.ndarray
 
 
+def carve_cache_key(sparse_dir: Path, resolution: int, max_rays: int) -> str:
+    """
+    Identity of a carve: the COLMAP model plus the two knobs that shape the grid.
+
+    Deliberately *not* keyed on the Gaussians. The carve describes where the
+    cameras looked, which is a property of the capture — the splat only ever
+    gets tested against it. That is what makes it reusable across cleanup runs
+    whose cleanup parameters differ.
+    """
+    import hashlib
+
+    digest = hashlib.sha256()
+    digest.update(f"v1|{int(resolution)}|{int(max_rays)}".encode())
+    for name in ("images.bin", "points3D.bin"):
+        path = Path(sparse_dir) / name
+        stat = path.stat()
+        digest.update(f"|{name}:{stat.st_size}:{int(stat.st_mtime_ns)}".encode())
+    return digest.hexdigest()[:16]
+
+
+def load_cached_carve(cache_dir: Path, key: str) -> CarveResult | None:
+    path = Path(cache_dir) / f"carve_{key}.npz"
+    if not path.is_file():
+        return None
+    try:
+        with np.load(path) as data:
+            grid = Grid(origin=data["origin"], voxel=float(data["voxel"]), dims=data["dims"])
+            return CarveResult(
+                grid=grid,
+                free=data["free"],
+                occupied=data["occupied"],
+                points=data["points"],
+                centres=data["centres"],
+                reference=data["reference"],
+            )
+    except (OSError, ValueError, KeyError):
+        # A truncated or stale-format cache must never be worse than no cache.
+        return None
+
+
+def save_cached_carve(cache_dir: Path, key: str, carve: CarveResult) -> Path:
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = cache_dir / f"carve_{key}.npz"
+    temporary = path.with_name(path.name + ".tmp")
+    # Write through a file handle: np.savez appends ".npz" to a *path* that does
+    # not end in it, so passing the temp name directly produces
+    # "carve_<key>.npz.tmp.npz" and the rename below then fails on a missing
+    # file — silently, since the caller treats OSError as "no cache today".
+    with open(temporary, "wb") as handle:
+        np.savez(
+            handle,
+            origin=carve.grid.origin,
+            voxel=carve.grid.voxel,
+            dims=carve.grid.dims,
+            free=carve.free,
+            occupied=carve.occupied,
+            points=carve.points,
+            centres=carve.centres,
+            reference=carve.reference,
+        )
+    temporary.replace(path)  # atomic: a half-written cache is never readable
+    return path
+
+
 def carve_from_colmap(
     positions: np.ndarray,
     sparse_dir: Path,
     *,
     resolution: int = 256,
     max_rays: int = 400_000,
+    cache_dir: Path | None = None,
 ) -> CarveResult:
     """Read a COLMAP sparse model and carve the volume its cameras saw through."""
     sparse_dir = Path(sparse_dir)
+
+    key = None
+    if cache_dir is not None:
+        try:
+            key = carve_cache_key(sparse_dir, resolution, max_rays)
+        except OSError:
+            key = None
+        if key is not None:
+            cached = load_cached_carve(cache_dir, key)
+            if cached is not None:
+                # The frame guard still runs: a cached carve is only valid for
+                # Gaussians in the same space, and the cache says nothing about
+                # which model is being cleaned.
+                require_same_frame(positions, cached.points)
+                return cached
+
     centres_by_id = read_images_bin(sparse_dir / "images.bin")
     points, tracks = read_points3d_bin(sparse_dir / "points3D.bin")
     require_same_frame(positions, points)
@@ -376,7 +458,7 @@ def carve_from_colmap(
         max_rays=max_rays,
         stop_margin=3.0 * grid.voxel,
     )
-    return CarveResult(
+    result = CarveResult(
         grid=grid,
         free=free,
         occupied=occupied,
@@ -384,6 +466,12 @@ def carve_from_colmap(
         centres=centres,
         reference=reference,
     )
+    if cache_dir is not None and key is not None:
+        try:
+            save_cached_carve(cache_dir, key, result)
+        except OSError:
+            pass  # a cache that cannot be written is not a reason to fail
+    return result
 
 
 def free_space_removal_mask(

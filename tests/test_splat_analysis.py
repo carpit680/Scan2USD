@@ -183,3 +183,107 @@ def test_more_votes_never_removes_more():
         for v in (1, 3, 10, 30)
     ]
     assert counts == sorted(counts, reverse=True)
+
+
+def _tiny_colmap(tmp_path, seed=0):
+    """A minimal binary COLMAP model the carve can actually read."""
+    import struct
+
+    rng = np.random.default_rng(seed)
+    wall, cameras = _box_room(rng, n=400)
+    sparse = tmp_path / "sparse" / "0"
+    sparse.mkdir(parents=True, exist_ok=True)
+
+    with open(sparse / "images.bin", "wb") as fid:
+        fid.write(struct.pack("<Q", len(cameras)))
+        for index, centre in enumerate(cameras, start=1):
+            # Identity rotation, so the stored tvec is -centre.
+            fid.write(struct.pack("<i", index))
+            fid.write(struct.pack("<dddd", 1.0, 0.0, 0.0, 0.0))
+            fid.write(struct.pack("<ddd", *(-centre)))
+            fid.write(struct.pack("<i", 1))
+            fid.write(b"f.jpg\x00")
+            fid.write(struct.pack("<Q", 0))
+
+    with open(sparse / "points3D.bin", "wb") as fid:
+        fid.write(struct.pack("<Q", len(wall)))
+        for point in wall:
+            fid.write(struct.pack("<Q", 1))
+            fid.write(struct.pack("<ddd", *point))
+            fid.write(struct.pack("<BBB", 200, 200, 200))
+            fid.write(struct.pack("<d", 0.5))
+            track = list(range(1, 5))
+            fid.write(struct.pack("<Q", len(track)))
+            for image_id in track:
+                fid.write(struct.pack("<ii", image_id, 0))
+    return sparse, wall
+
+
+def test_carve_cache_returns_the_same_result_and_is_faster(tmp_path):
+    """A cache that changes the answer is worse than no cache."""
+    sparse, wall = _tiny_colmap(tmp_path)
+    positions = wall + np.array([0.0, 0.0, 0.01])
+    cache = tmp_path / "carve_cache"
+
+    cold = analyze_splat.carve_from_colmap(
+        positions, sparse, resolution=32, max_rays=20_000, cache_dir=cache
+    )
+    # The exact filename, not a glob: an earlier version left a
+    # "carve_<key>.npz.tmp.npz" turd behind when the atomic rename failed, and a
+    # glob for carve_*.npz matched it, so this test passed while the cache was
+    # never actually written or read.
+    key = analyze_splat.carve_cache_key(sparse, 32, 20_000)
+    assert (cache / f"carve_{key}.npz").is_file()
+    assert not list(cache.glob("*.tmp*")), "temporary files must not survive"
+
+    # Prove the warm run reads the cache rather than recomputing, by making the
+    # expensive step fail loudly if it is reached. Hiding the model file would
+    # not work: the cache key stats it, so removing it disables the cache too.
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError("carve_free_space ran on a cache hit")
+
+    original = analyze_splat.carve_free_space
+    analyze_splat.carve_free_space = _must_not_run
+    try:
+        warm = analyze_splat.carve_from_colmap(
+            positions, sparse, resolution=32, max_rays=20_000, cache_dir=cache
+        )
+    finally:
+        analyze_splat.carve_free_space = original
+
+    assert np.array_equal(cold.free, warm.free)
+    assert np.array_equal(cold.occupied, warm.occupied)
+    assert np.array_equal(cold.points, warm.points)
+    assert np.allclose(cold.reference, warm.reference)
+    assert cold.grid.dims.tolist() == warm.grid.dims.tolist()
+    assert cold.grid.voxel == pytest.approx(warm.grid.voxel)
+
+
+def test_carve_cache_key_tracks_the_inputs_that_change_the_answer(tmp_path):
+    """Grid knobs and the COLMAP model must all invalidate; nothing else should."""
+    sparse, _ = _tiny_colmap(tmp_path)
+    base = analyze_splat.carve_cache_key(sparse, 32, 20_000)
+
+    assert analyze_splat.carve_cache_key(sparse, 64, 20_000) != base
+    assert analyze_splat.carve_cache_key(sparse, 32, 40_000) != base
+    assert analyze_splat.carve_cache_key(sparse, 32, 20_000) == base
+
+    # Re-running COLMAP rewrites the model; the cache must not survive that.
+    import os
+
+    path = sparse / "points3D.bin"
+    os.utime(path, (0, 0))
+    assert analyze_splat.carve_cache_key(sparse, 32, 20_000) != base
+
+
+def test_a_corrupt_cache_is_ignored_not_fatal(tmp_path):
+    sparse, wall = _tiny_colmap(tmp_path)
+    cache = tmp_path / "carve_cache"
+    cache.mkdir()
+    key = analyze_splat.carve_cache_key(sparse, 32, 20_000)
+    (cache / f"carve_{key}.npz").write_bytes(b"not an npz")
+
+    result = analyze_splat.carve_from_colmap(
+        wall, sparse, resolution=32, max_rays=20_000, cache_dir=cache
+    )
+    assert result.free.size > 0

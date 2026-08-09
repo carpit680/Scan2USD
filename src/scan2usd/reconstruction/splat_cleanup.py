@@ -184,8 +184,20 @@ def _neighbor_counts(points: np.ndarray, radius: float) -> np.ndarray:
         return counts[inverse] - 1
 
 
-def _carve(positions: np.ndarray, sparse_dir: Path, params: SplatCleanupParams):
-    """Carve the volume the cameras saw through. Reused for removal and metrics."""
+def _carve(
+    positions: np.ndarray,
+    sparse_dir: Path,
+    params: SplatCleanupParams,
+    cache_dir: Path | None = None,
+):
+    """
+    Carve the volume the cameras saw through. Reused for removal and metrics.
+
+    Cached on disk when ``cache_dir`` is given. The carve depends only on the
+    COLMAP model and the two grid knobs — not on any cleanup threshold — so a
+    tuner sweep recomputes an identical result once per trial. Keyed on the
+    sparse model's size and mtime, so a re-run of COLMAP invalidates it.
+    """
     from scan2usd.reconstruction.free_space import carve_from_colmap
 
     return carve_from_colmap(
@@ -193,6 +205,7 @@ def _carve(positions: np.ndarray, sparse_dir: Path, params: SplatCleanupParams):
         sparse_dir,
         resolution=params.carve_resolution,
         max_rays=params.carve_max_rays,
+        cache_dir=cache_dir,
     )
 
 
@@ -598,7 +611,12 @@ def cleanup_particlefield_file(
     carve = None
     if colmap_sparse_dir is not None:
         try:
-            carve = _carve(loaded["positions"], Path(colmap_sparse_dir), params)
+            carve = _carve(
+                loaded["positions"],
+                Path(colmap_sparse_dir),
+                params,
+                cache_dir=output_path.parent / "carve_cache",
+            )
         except Exception as exc:  # noqa: BLE001
             # Never mis-carve on a frame mismatch or a missing model: the rule is
             # only meaningful if the Gaussians and the COLMAP points are in the
