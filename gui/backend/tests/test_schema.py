@@ -217,3 +217,26 @@ def test_tools_scripts_are_under_tools():
         assert t["script"].startswith("tools/"), t["id"]
         assert t.get("job_kind") == "tool"
         assert ".." not in t["script"]
+
+
+def test_pipeline_stage_buttons_map_to_real_commands():
+    """
+    Every stage button either runs a declared command or navigates somewhere.
+
+    A stage whose `command` has no COMMAND_DEFS entry renders a button that
+    fails when pressed, and the failure looks like a broken pipeline rather
+    than a missing schema row.
+    """
+    from scan2usd_gui.schema import PIPELINE_STAGES
+
+    declared = {cmd["id"] for cmd in COMMAND_DEFS}
+    for stage in PIPELINE_STAGES:
+        command = stage.get("command")
+        if command is None:
+            assert stage.get("href"), f"{stage['id']} has neither a command nor a link"
+            continue
+        assert command in declared, f"{stage['id']} runs undeclared command {command!r}"
+
+    # The one-command video→preview path is the first thing offered, because it
+    # is the only stage that gets you to something you can look at.
+    assert PIPELINE_STAGES[0]["id"] == "splat"

@@ -44,6 +44,79 @@ from scan2usd.synthetic.transforms_io import find_transforms_json, load_transfor
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 
 
+def _extract_frames_from_video(
+    cfg: SceneConfig,
+    *,
+    force: bool,
+    stride: int,
+    max_frames: int,
+    blur_threshold: float | None,
+    min_features: int | None,
+    caller: str,
+) -> None:
+    """
+    Shared frame extraction for ``reconstruct`` and ``splat``.
+
+    Deliberately not the ``preprocess`` path, which passes neither ``max_dim``
+    nor ``min_features`` and defaults to stride 1 with no cap — on a 4K capture
+    that writes every decoded frame at native resolution.
+    """
+    if not (cfg.video_path and Path(cfg.video_path).is_file()):
+        if force:
+            raise typer.BadParameter(
+                f"{caller} --force requires a valid video_path to re-extract frames"
+            )
+        raise typer.BadParameter(
+            f"Missing or empty frames_dir: {cfg.frames_dir}. "
+            "Run `scan2usd preprocess …` or set video_path to a valid file."
+        )
+    cap = None if max_frames == 0 else max_frames
+    cfg.frames_dir.mkdir(parents=True, exist_ok=True)
+    if force and frames_dir_has_images(cfg.frames_dir):
+        removed = clear_frame_images(cfg.frames_dir)
+        typer.echo(f"Force: cleared {removed} existing frames under {cfg.frames_dir}")
+    typer.echo(
+        f"{'Re-extracting' if force else 'Extracting'} from {cfg.video_path} "
+        f"(stride={stride}, max_frames={cap}) …"
+    )
+    extract_frames(
+        Path(cfg.video_path),
+        cfg.frames_dir,
+        stride=stride,
+        max_frames=cap,
+        blur_threshold=(
+            blur_threshold
+            if blur_threshold is not None
+            else cfg.reconstruction.blur_threshold
+        ),
+        min_features=(
+            min_features
+            if min_features is not None
+            else cfg.reconstruction.min_frame_features
+        ),
+        max_dim=cfg.reconstruction.frame_max_dim,
+    )
+
+
+def _check_registration_rate(cfg: SceneConfig, threshold: float) -> tuple[int, int]:
+    """Report COLMAP's registration rate and refuse to continue below ``threshold``."""
+    registered = len(parse_images_txt(cfg.colmap_txt_dir / "images.txt"))
+    candidates = len(list_frame_images(cfg.frames_dir))
+    rate = registered / candidates if candidates else 0.0
+    typer.echo(f"COLMAP registered {registered}/{candidates} frames ({rate:.0%})")
+    if threshold > 0 and rate < threshold:
+        raise typer.BadParameter(
+            f"COLMAP registered only {registered}/{candidates} frames ({rate:.0%}), below the "
+            f"{threshold:.0%} minimum. Everything downstream (floor plane, splat, collision "
+            "geometry) would be fit to these few views and look built but be wrong. "
+            "Usual causes: motion blur, too-large gaps between frames, textureless surfaces. "
+            "Try a denser/sharper extraction (e.g. --video-stride 8 --blur-threshold 100), "
+            "or recapture with slower motion and locked exposure/focus. "
+            "Pass --min-registration-rate 0 to proceed anyway."
+        )
+    return registered, candidates
+
+
 @app.command()
 def preprocess(
     config: Path = typer.Argument(..., exists=True, dir_okay=False),
@@ -140,40 +213,14 @@ def reconstruct(
     cfg = SceneConfig.load(config)
     need_extract = force or not frames_dir_has_images(cfg.frames_dir)
     if need_extract:
-        if not (cfg.video_path and Path(cfg.video_path).is_file()):
-            if force:
-                raise typer.BadParameter(
-                    "reconstruct --force requires a valid video_path to re-extract frames"
-                )
-            raise typer.BadParameter(
-                f"Missing or empty frames_dir: {cfg.frames_dir}. "
-                "Run `scan2usd preprocess …` or set video_path to a valid file."
-            )
-        cap = None if video_max_frames == 0 else video_max_frames
-        cfg.frames_dir.mkdir(parents=True, exist_ok=True)
-        if force and frames_dir_has_images(cfg.frames_dir):
-            removed = clear_frame_images(cfg.frames_dir)
-            typer.echo(f"Force: cleared {removed} existing frames under {cfg.frames_dir}")
-        typer.echo(
-            f"{'Re-extracting' if force else 'Extracting'} from {cfg.video_path} "
-            f"(stride={video_stride}, max_frames={cap}) …"
-        )
-        extract_frames(
-            Path(cfg.video_path),
-            cfg.frames_dir,
+        _extract_frames_from_video(
+            cfg,
+            force=force,
             stride=video_stride,
-            max_frames=cap,
-            blur_threshold=(
-                blur_threshold
-                if blur_threshold is not None
-                else cfg.reconstruction.blur_threshold
-            ),
-            min_features=(
-                min_features
-                if min_features is not None
-                else cfg.reconstruction.min_frame_features
-            ),
-            max_dim=cfg.reconstruction.frame_max_dim,
+            max_frames=video_max_frames,
+            blur_threshold=blur_threshold,
+            min_features=min_features,
+            caller="reconstruct",
         )
     if skip_process_data:
         if force:
@@ -193,25 +240,12 @@ def reconstruct(
     export_colmap_to_txt(sparse, cfg.colmap_txt_dir, colmap_bin=resolve_colmap(cfg))
     typer.echo(f"COLMAP TXT at {cfg.colmap_txt_dir}")
 
-    registered = len(parse_images_txt(cfg.colmap_txt_dir / "images.txt"))
-    candidates = len(list_frame_images(cfg.frames_dir))
-    rate = registered / candidates if candidates else 0.0
-    typer.echo(f"COLMAP registered {registered}/{candidates} frames ({rate:.0%})")
-    threshold = (
+    _check_registration_rate(
+        cfg,
         min_registration_rate
         if min_registration_rate is not None
-        else cfg.reconstruction.min_registration_rate
+        else cfg.reconstruction.min_registration_rate,
     )
-    if threshold > 0 and rate < threshold:
-        raise typer.BadParameter(
-            f"COLMAP registered only {registered}/{candidates} frames ({rate:.0%}), below the "
-            f"{threshold:.0%} minimum. Everything downstream (floor plane, splat, collision "
-            "geometry) would be fit to these few views and look built but be wrong. "
-            "Usual causes: motion blur, too-large gaps between frames, textureless surfaces. "
-            "Try a denser/sharper extraction (e.g. --video-stride 8 --blur-threshold 100), "
-            "or recapture with slower motion and locked exposure/focus. "
-            "Pass --min-registration-rate 0 to proceed anyway."
-        )
     if not skip_train:
         ckpt = ns_train_splatfacto(
             cfg,
@@ -827,6 +861,130 @@ def apply_metric_scale(
     typer.echo(f"Wrote {out_path}")
     typer.echo(f"Approved scale: {scale:.9g} meters/source-unit")
     typer.echo("Rebuild baked geometry (objects/static) and package-usd so meshes match the new T.")
+
+
+@app.command()
+def splat(
+    config: Path = typer.Argument(..., exists=True, dir_okay=False),
+    video_stride: int = typer.Option(15, "--video-stride"),
+    video_max_frames: int = typer.Option(600, "--video-max-frames", help="0 = no cap"),
+    blur_threshold: Optional[float] = typer.Option(None, "--blur-threshold"),
+    min_features: Optional[int] = typer.Option(None, "--min-features"),
+    min_registration_rate: Optional[float] = typer.Option(None, "--min-registration-rate"),
+    force_frames: bool = typer.Option(False, help="Re-extract frames even if some exist"),
+    force_train: bool = typer.Option(False, help="Retrain even if a splat already exists"),
+    sh_degree: int = typer.Option(
+        0, help="Preview colour detail. 0 is flat and ~4x smaller to download."
+    ),
+    skip_floor: bool = typer.Option(
+        False, help="Skip floor alignment; the preview then opens in raw COLMAP orientation."
+    ),
+) -> None:
+    """
+    Video → clean Gaussian splat → ``preview.ply``, and nothing else.
+
+    The whole splat path in one resumable command. Everything USD — collision
+    geometry, objects, materials, lighting, packaging, Isaac validation — is
+    skipped, because none of it feeds the splat: they read it or copy it.
+    ``ns-train splatfacto`` is skipped too; nothing downstream has ever read its
+    output.
+
+    Each step is skipped when its output already exists, so changing a training
+    setting and re-running does only the training onward. That is the loop worth
+    optimising: COLMAP is ~22 minutes and runs once, while training is most of
+    the wall-clock and is what actually gets iterated on.
+
+    Also pins the build mode to ``preview`` throughout. Chaining the individual
+    commands by hand does not work on default arguments: ``init-usd`` defaults to
+    production while ``align-floor`` and ``cleanup-splat`` default to preview, and
+    the orchestrator refuses the mismatch.
+    """
+    import subprocess
+
+    from scan2usd.pipeline.orchestrator import PipelineOrchestrator
+    from scan2usd.reconstruction.external_cli import resolve_external_command
+    from scan2usd.reconstruction.grut import export_environment_particlefield
+
+    cfg = SceneConfig.load(config)
+
+    if force_frames or not frames_dir_has_images(cfg.frames_dir):
+        _extract_frames_from_video(
+            cfg,
+            force=force_frames,
+            stride=video_stride,
+            max_frames=video_max_frames,
+            blur_threshold=blur_threshold,
+            min_features=min_features,
+            caller="splat",
+        )
+    else:
+        typer.echo(f"[1/5] frames: reusing {cfg.frames_dir}")
+
+    sparse = find_ns_colmap_sparse(cfg.nerfstudio_data_dir)
+    if sparse is None:
+        typer.echo("[2/5] COLMAP: running ns-process-data …")
+        ns_process_data_images(cfg, cfg.frames_dir, cfg.nerfstudio_data_dir)
+        sparse = find_ns_colmap_sparse(cfg.nerfstudio_data_dir)
+        if sparse is None:
+            raise RuntimeError("COLMAP sparse not found after ns-process-data")
+    else:
+        typer.echo(f"[2/5] COLMAP: reusing {sparse}")
+
+    if not (cfg.colmap_txt_dir / "images.txt").is_file():
+        cfg.colmap_txt_dir.mkdir(parents=True, exist_ok=True)
+        export_colmap_to_txt(sparse, cfg.colmap_txt_dir, colmap_bin=resolve_colmap(cfg))
+    _check_registration_rate(
+        cfg,
+        min_registration_rate
+        if min_registration_rate is not None
+        else cfg.reconstruction.min_registration_rate,
+    )
+
+    orchestrator = PipelineOrchestrator(cfg, config.resolve(), build_mode="preview")
+    if not skip_floor:
+        typer.echo("[3/5] floor alignment …")
+        orchestrator.align_floor()
+
+    # Through run_stage, so resuming uses the same completed-and-artifact-present
+    # predicate as `build-usd`. Calling export_environment_particlefield directly
+    # would retrain every time — it has no such check of its own, and training is
+    # the one stage where repeating the work costs more than everything else
+    # combined.
+    trained = orchestrator.run_stage(
+        "visual_particlefield",
+        lambda: export_environment_particlefield(cfg, orchestrator.manifest),
+        force=force_train,
+        ready=lambda: orchestrator._artifact_ready("environment_splat"),
+    )
+    if trained is None:
+        typer.echo("[4/5] 3DGRUT: reusing existing splat (--force-train to retrain)")
+    orchestrator.manifest.save(orchestrator.manifest_path)
+
+    splat_usd = cfg.workspace_dir / "build" / "visual" / "environment_splat.usd"
+    if not splat_usd.is_file():
+        raise RuntimeError(f"Training produced no splat at {splat_usd}")
+
+    typer.echo("[5/5] preview PLY …")
+    isaac = resolve_external_command(cfg, "isaac_python", default="python.sh", required=True)
+    assert isaac is not None
+    script = Path(__file__).resolve().parents[2] / "tools" / "geometry" / "export_splat_ply.py"
+    preview = splat_usd.parent / "preview.ply"
+    argv = [
+        *isaac,
+        str(script),
+        "--stage",
+        str(splat_usd),
+        "--out",
+        str(preview),
+        "--sh-degree",
+        str(sh_degree),
+        "--colmap",
+        str(sparse),
+    ]
+    if orchestrator.manifest_path.is_file():
+        argv += ["--manifest", str(orchestrator.manifest_path)]
+    subprocess.run(argv, check=True)
+    typer.echo(f"\nPreview ready: {preview}\nOpen the GUI Preview tab and press Show scene.")
 
 
 @app.command("build-visual-usd")

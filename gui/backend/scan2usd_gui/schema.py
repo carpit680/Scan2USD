@@ -2158,6 +2158,66 @@ COMMAND_DEFS: list[dict[str, Any]] = [
         ],
     },
     {
+        "id": "splat",
+        "label": "Build splat (video → preview)",
+        "category": "hybrid",
+        "description": (
+            "The whole splat path in one resumable step: frames → COLMAP → 3DGRUT "
+            "→ cleanup → preview.ply, ready in the Preview tab. Skips everything "
+            "USD (collision geometry, objects, materials, lighting, packaging, "
+            "Isaac) because none of it feeds the splat — those stages read it or "
+            "copy it. Re-running after a training change redoes only the training "
+            "onward, since COLMAP runs once and takes about 22 minutes while "
+            "training is most of the wall-clock."
+        ),
+        "guide_anchor": "hybrid",
+        "needs_config": True,
+        "options": [
+            _opt(
+                "splat", "video_stride", "Video stride", "int",
+                "Keep every Nth sharp frame when extracting. Only used if frames_dir is empty.",
+                15,
+            ),
+            _opt(
+                "splat", "video_max_frames", "Max frames", "int",
+                "Cap on extracted frames (0 = no cap).", 600,
+            ),
+            _opt(
+                "splat", "sh_degree", "Preview colour detail", "int",
+                "Spherical-harmonics degree in the preview PLY. 0 is flat colour and "
+                "about 4x smaller to download; 3 keeps view-dependent colour.",
+                0,
+            ),
+            _opt(
+                "splat", "force_train", "Force retrain", "bool",
+                "Retrain even when a splat already exists. Off by default so a re-run "
+                "resumes rather than repeating hours of training.",
+                False,
+            ),
+            _opt(
+                "splat", "force_frames", "Force re-extract frames", "bool",
+                "Re-extract from the video even if frames are present.", False,
+            ),
+            _opt(
+                "splat", "skip_floor", "Skip floor alignment", "bool",
+                "Leave the preview in raw COLMAP orientation instead of Z-up.", False,
+            ),
+            _opt(
+                "splat", "min_registration_rate", "Min registration rate", "float",
+                "Fail if COLMAP registers fewer than this fraction of frames "
+                "(default: reconstruction.min_registration_rate; 0 disables).", None,
+            ),
+            _opt(
+                "splat", "blur_threshold", "Blur threshold", "float",
+                "Laplacian-variance floor for frame extraction (default: config value).", None,
+            ),
+            _opt(
+                "splat", "min_features", "Min frame features", "int",
+                "Drop frames with fewer SIFT features than this (default: config value).", None,
+            ),
+        ],
+    },
+    {
         "id": "build-visual-usd",
         "label": "Build visual USD",
         "category": "hybrid",
@@ -2394,6 +2454,18 @@ CONFIG_GROUPS = [
 
 PIPELINE_STAGES = [
     {
+        "id": "splat",
+        "label": "Video → viewable splat",
+        "command": "splat",
+        "description": (
+            "The short path: frames, camera poses, 3DGRUT training and cleanup, "
+            "ending in a preview you can open in the Preview tab. Skips everything "
+            "USD. Re-running only redoes what changed, so a retrain after a config "
+            "edit does not repeat the camera solve."
+        ),
+        "guide_anchor": "hybrid",
+    },
+    {
         "id": "reconstruct",
         "label": "Build cameras from your video",
         "command": "reconstruct",
@@ -2473,6 +2545,7 @@ EXPECTED_CLI_COMMANDS = frozenset(
     {
         "preprocess",
         "reconstruct",
+        "splat",
         "label",
         "lift",
         "debug-lift",

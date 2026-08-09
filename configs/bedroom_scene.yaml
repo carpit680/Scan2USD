@@ -2,7 +2,11 @@ name: bedroom
 video_path: /home/arpit/Scan2USD/workspace_bedroom/uploads/bedroom_scene.MOV
 workspace_dir: workspace_bedroom
 process_data:
-  num_downscales: 2
+  # 0 = write no images_2/images_4 pyramid. Nothing on the hybrid USD path reads
+  # it (COLMAP always uses the full-resolution images/, and 3DGRUT stages its own
+  # copies) — it exists only for legacy Splatfacto. On this capture that is 928
+  # ffmpeg encodes and ~250 MB for files no command opens.
+  num_downscales: 0
 classes:
 - bed
 - pillow
@@ -30,7 +34,12 @@ reconstruction:
   blur_threshold: 0
   min_frame_features: 300
   frame_max_dim: 0
-  grut_downscale: 1
+  # Frames stay at capture resolution (frame_max_dim: 0) because COLMAP's pose
+  # accuracy is the one thing everything downstream is fitted to, and it clamps
+  # to 3200 internally anyway. Training resolution is a separate decision:
+  # 3DGRUT's cost is pixels per iteration, and 4K is ~4x the pixels of 1080p for
+  # detail this capture's poses cannot support. 2 = train at 1080p.
+  grut_downscale: 2
   grut_config: apps/colmap_3dgut.yaml
   grut_max_iterations: 50000
   held_out_ratio: 0.1

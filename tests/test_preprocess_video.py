@@ -49,3 +49,52 @@ def test_extract_frames_respects_max_dim(tmp_path):
     assert paths
     img = cv2.imread(str(paths[0]))
     assert max(img.shape[:2]) == 640
+
+
+def test_stride_skipping_keeps_the_same_frames_it_used_to(tmp_path):
+    """
+    grab() replaced read() for stride-rejected frames — same frames, less work.
+
+    Measured on the 4K bedroom capture this is 5.5x faster, which only counts
+    if the kept frames are unchanged: a decoder advanced differently would
+    silently shift which moments COLMAP registers.
+    """
+    import cv2
+    import numpy as np
+    import pytest
+
+    from scan2usd.preprocess.video import extract_frames
+
+    video = tmp_path / "clip.mp4"
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"mp4v"), 10, (160, 120))
+    rng = np.random.default_rng(1)
+    for _ in range(12):
+        writer.write(rng.integers(0, 255, (120, 160, 3), dtype=np.uint8))
+    writer.release()
+    if not video.is_file():
+        pytest.skip("OpenCV cannot write mp4 here")
+
+    # The loop as it was: decode every frame, apply the stride afterwards, and
+    # write with the same JPEG settings so the comparison is file-to-file.
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir()
+    expected = []
+    cap = cv2.VideoCapture(str(video), cv2.CAP_FFMPEG)
+    index = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if index % 3 == 0:
+            target = reference_dir / f"frame_{len(expected):06d}.jpg"
+            cv2.imwrite(str(target), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            expected.append(target)
+        index += 1
+    cap.release()
+    if not expected:
+        pytest.skip("OpenCV cannot decode mp4 here")
+
+    paths = extract_frames(video, tmp_path / "frames", stride=3, blur_threshold=0)
+    assert len(paths) == len(expected)
+    for path, reference in zip(paths, expected, strict=True):
+        assert path.read_bytes() == reference.read_bytes()

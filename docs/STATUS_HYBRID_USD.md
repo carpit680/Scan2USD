@@ -207,6 +207,93 @@ Two bugs found by running this for real, both fixed:
    broken one (kitchen 6.1% vs desk 3.9%). Replaced by
    ``geometry.max_points_below_floor`` (kitchen 2.4% vs desk 34.4%).
 
+Iteration speed: video → viewable splat (2026-08-08)
+----------------------------------------------------
+Scope narrowed to one thing: a clean splat in the GUI Preview tab, produced
+fast enough to retry training changes. USD packaging, collision geometry,
+objects, lighting and Isaac are deliberately off this path.
+
+**A correction that reshaped the work.** SfM was previously reported at 2h23m.
+Reconciling artifact mtimes: ``ns_data`` images finish 19:37:39, ``database.db``
+(extraction + matching) 19:51:21, the sparse model 19:58:01 — COLMAP is
+**~22 minutes**, not 2h23m. The 2h10m attributed to it was idle wall-clock
+between two separately-run commands. Training, not SfM, is ~85% of a fresh run,
+which also makes GLOMAP irrelevant here: it replaces only the 7-minute mapper.
+
+``scan2usd splat <config>`` runs frames → COLMAP → floor → 3DGRUT + cleanup →
+``preview.ply``, each stage skipped when its output is present. It is the first
+button on the GUI pipeline page. The training step goes through
+``PipelineOrchestrator.run_stage``; an earlier version called
+``export_environment_particlefield`` directly, which retrained on every
+invocation — the opposite of the intent, and invisible to the source-grep test
+that was supposed to cover it. ``tests/test_pipeline_contracts.py`` now drives
+the command twice and asserts the second run does not train.
+
+Measured on the bedroom capture (928 frames, 3840×2160, 24 cores):
+
+===============================  ==========  ==========  ==========
+stage                            before      after       note
+===============================  ==========  ==========  ==========
+Frame extraction (48-frame bench) 15.2 s      2.8 s       5.5x — ``cap.grab()``
+3DGRUT staging (48-frame bench)   5.5 s       0.6 s       9.7x — process pool
+3DGRUT staging, unchanged re-run  full work   0.00 s      content-keyed skip
+===============================  ==========  ==========  ==========
+
+Both are byte-identical to the serial path, checked on the real capture (40/40
+frames, 48/48 staged images) and pinned by tests. ``cap.grab()`` advances the
+decoder exactly as ``read()`` does but skips the BGR conversion of the 14-in-15
+frames the stride throws away.
+
+Other waste removed: ``process_data.num_downscales: 0`` on the bedroom config.
+Nothing on the hybrid path reads ``images_2``/``images_4`` — COLMAP always uses
+the full-resolution ``images/`` — so the pyramid was 928 ffmpeg encodes and
+~250 MB written for files no command opens. ``docs/USAGE.md`` described
+``num_downscales: 1`` as "full-res COLMAP"; that was wrong and is corrected.
+
+**Training resolution** is now ``reconstruction.grut_downscale: 2`` (1080p) on
+the bedroom config, kept separate from ``frame_max_dim: 0``: COLMAP still gets
+full-resolution frames, because pose accuracy is what everything downstream is
+fitted to.
+
+Measured, 50k iterations, same COLMAP solve, 74 held-out views scored at render
+resolution with LPIPS:
+
+=========  ==========  =========  ========  ========  ===========
+model      train time  Gaussians  PSNR      SSIM      LPIPS
+=========  ==========  =========  ========  ========  ===========
+4K         3 h 25 m    519,893    18.965    0.7407    0.4351
+1080p      53 m        904,885    19.372    0.7426    0.4159
+=========  ==========  =========  ========  ========  ===========
+
+**3.8x faster and no worse** — slightly better on all three, though the SSIM gap
+(+0.002) is a tie in practice. Fog is zero in both (``fog_inside_hull: 0``,
+transmittance 1.0 across the 14.4 m room). The 1080p model carries *more*
+Gaussians, not fewer: densification is gradient-driven, and lower-resolution
+gradients cross the split/clone threshold more often. Cost of that: the preview
+PLY grows 35 MB → 61.5 MB.
+
+**Two measurement traps, both hit before the numbers above were trusted.**
+
+1. ``tools/isaac/render_heldout.py`` transforms cameras into USD frame, which
+   assumes the stage is the *packaged* scene carrying the COLMAP→USD xformOp.
+   Pointed at a raw ``environment_splat.usd`` (still COLMAP-frame) it renders
+   cameras and geometry in different frames: visibly smeared output, PSNR ~10,
+   and a plausible-looking 0.25 PSNR "difference" between two equally broken
+   renders. To score a raw splat, pass a manifest whose COLMAP→USD matrix is
+   identity. Confirmed by re-rendering the 4K splat this way and landing within
+   0.07 PSNR of the independently recorded baseline.
+2. Staging wrote through symlinks — see below.
+
+**Data loss (fixed).** Staging at ``grut_downscale: 1`` symlinks each staged
+frame back to ``ns_data/images``. Raising it to 2 makes staging write a resized
+JPEG to that same path, and ``PIL.Image.save`` follows symlinks — so all 928
+full-resolution captures were overwritten with half-size copies, silently, while
+the run reported success. ``_clear_target`` now unlinks before every staged
+write, and the regression test asserts on the *source* bytes because the staged
+output looks correct either way. Recovery was possible only because
+``frames_dir`` holds the untouched extraction; the restore verified each file's
+identity by content before overwriting it.
+
 ROOT CAUSE of the (unusable) desk build (2026-07-26)
 -----------------------------------------------------
 The desk scan is **not tunable — it must be recaptured**. COLMAP registered

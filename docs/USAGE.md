@@ -72,6 +72,30 @@ Heavy runtimes stay isolated and are configured under `external`:
 
 Run `scan2usd doctor configs/example_scene.yaml` before building.
 
+### Just the splat (no USD)
+
+When you want to look at the scene rather than simulate it — tuning training or
+cleanup, checking a fresh capture — the USD half of the pipeline is dead weight.
+One command goes from video to something viewable:
+
+```bash
+scan2usd splat configs/bedroom_scene.yaml
+```
+
+Frames → COLMAP → floor alignment → 3DGRUT training + cleanup →
+`<workspace>/build/visual/preview.ply`, which the GUI **Preview** tab serves
+directly. It is also the first button on the GUI pipeline page.
+
+Every stage is skipped when its output already exists, so a re-run after a
+config change does only the work that change invalidated — a retrain reuses the
+camera solve, which is otherwise ~22 minutes you would pay again. Use
+`--force-train` to retrain over an existing splat and `--force-frames` to
+re-extract from the video.
+
+Deliberately not run: segmentation/review, collision geometry, objects,
+materials, lighting, USD packaging, validation, and legacy Splatfacto. Use
+`build-usd` when you want the Isaac scene.
+
 ### Build and review
 
 ```bash
@@ -118,10 +142,10 @@ Live status (done / pending / next focus) for the hybrid kitchen scene is in
 ### Environment splat quality (3DGRUT)
 
 **Config tiers:** use **`configs/high_quality_scene.yaml`** for final hybrid USD builds
-(50k iters, full-res COLMAP via `process_data.num_downscales: 1`, densify/SSIM/SH
-overrides). It is a drop-in replacement for `configs/example_scene.yaml` (same workspace
-paths). Use **`configs/example_scene.yaml`** for day-to-day work (currently also 50k-capable
-but `num_downscales: 2` to save disk/VRAM). For quick pipeline checks, set
+(50k iters, densify/SSIM/SH overrides). It is a drop-in replacement for
+`configs/example_scene.yaml` (same workspace paths). Use
+**`configs/example_scene.yaml`** for day-to-day work (currently also 50k-capable).
+For quick pipeline checks, set
 **`grut_max_iterations: 5000`** (preview — often soft / under-densified).
 
 - **`grut_max_iterations: 5000`** — fast preview; often soft / under-densified.
@@ -164,8 +188,8 @@ scan2usd package-usd configs/example_scene.yaml
 
 **Sharpness** (ParticleField look):
 
-1. Train with `configs/high_quality_scene.yaml` (SH ramp every 500 steps +
-   `num_downscales: 1` — may need re-preprocess for full-res COLMAP).
+1. Train with `configs/high_quality_scene.yaml` (SH ramp every 500 steps).
+   Training resolution is `reconstruction.grut_downscale`, not `num_downscales`.
 2. More iterations / densify help up to ~50k; gains diminish after that.
 3. Capture quality (less blur, more overlap, better lighting).
 4. `splat_cleanup.outlier_std`: higher keeps fine haze, more floaters; lower cleans
@@ -411,7 +435,7 @@ Resolution order: **explicit path in YAML** → `which` on `PATH` → `python -m
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `num_downscales` | int | `3` | Image pyramid depth (÷2 each level). **Lower = sharper** inputs (e.g. `2` or `1`). More VRAM/disk. |
+| `num_downscales` | int | `3` | Depth of the `images_2`/`images_4`/… pyramid `ns-process-data` writes. **COLMAP is not affected** — it always reads the untouched full-resolution `images/`, and the hybrid USD pipeline never opens the pyramid either. Only the legacy Splatfacto path uses it, so `0` is right for hybrid-only scenes and saves an ffmpeg encode per frame plus the disk. |
 
 ### `splatfacto` — passed to `ns-train splatfacto`
 
@@ -431,7 +455,7 @@ These map to Nerfstudio CLI flags (see [Nerfstudio docs](https://docs.nerf.studi
 | `model_num_downscales` | int or omit | *(omit)* | `--pipeline.model.num-downscales` | Multi-res **training** schedule (default in Nerfstudio: `2`). |
 | `camera_optimizer_mode` | string | `off` | `--pipeline.model.camera-optimizer.mode` | `off`, `SO3xR3`, or `SE3` for mild pose refinement. |
 
-**Note:** Input resolution is controlled by `process_data.num_downscales` and Nerfstudio’s auto downscale (logged as “Auto image downscale factor of …”). There is **no** `dataparser_downscale_factor` in the `ns-train splatfacto` CLI.
+**Note (legacy Splatfacto only):** its input resolution is controlled by `process_data.num_downscales` and Nerfstudio’s auto downscale (logged as “Auto image downscale factor of …”). There is **no** `dataparser_downscale_factor` in the `ns-train splatfacto` CLI.
 
 **Example tuning block** (uneven lighting / shadows):
 
@@ -573,6 +597,33 @@ scan2usd preprocess configs/example_scene.yaml [OPTIONS]
 Blur rejection: Laplacian variance below **50** (fixed in code) drops blurry frames.
 
 Supported video extensions (typical): `.mp4`, `.mov`, `.mkv`, `.avi`, `.webm`, … (OpenCV + FFmpeg).
+
+---
+
+### `scan2usd splat`
+
+**Purpose:** Video → viewable Gaussian splat, skipping everything USD. See
+[Just the splat (no USD)](#just-the-splat-no-usd).
+
+```bash
+scan2usd splat configs/bedroom_scene.yaml [OPTIONS]
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--video-stride` | int | `15` | Keep every Nth frame when extracting from `video_path`. |
+| `--video-max-frames` | int | `600` | Cap extracted frames (`0` = no cap). |
+| `--blur-threshold` | float or omit | YAML `reconstruction.blur_threshold` | Laplacian-variance floor. |
+| `--min-features` | int or omit | YAML `reconstruction.min_frame_features` | SIFT-keypoint floor; rejects textureless frames. |
+| `--min-registration-rate` | float or omit | YAML `reconstruction.min_registration_rate` | Refuse to continue below this COLMAP registration rate. `0` disables. |
+| `--force-frames` | flag | off | Re-extract from video even if `frames_dir` has images. |
+| `--force-train` | flag | off | Retrain even when a splat already exists. |
+| `--sh-degree` | int | `0` | Preview colour detail. `0` is flat and ~4x smaller to download; `3` keeps view-dependent colour. |
+| `--skip-floor` | flag | off | Skip floor alignment; the preview then opens in raw COLMAP orientation. |
+
+**Resume:** each stage runs only when its output is missing. Training is guarded
+by the same predicate `build-usd` uses, so a re-run with a completed splat does
+nothing — the expensive stage is the whole point of the command being resumable.
 
 ---
 

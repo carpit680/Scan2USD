@@ -361,3 +361,129 @@ def test_anti_fog_is_off_until_asked_for(tmp_path):
     # Weight pruning must not outlive densification, or it hollows the model out.
     assert "strategy.prune_weight.end_iteration=25000" in args
     assert "strategy.prune_weight.start_iteration=10000" in args
+
+
+def _staged_bytes(images_dir):
+    return {
+        path.name: path.read_bytes()
+        for path in sorted(images_dir.iterdir())
+        if path.is_file()
+    }
+
+
+def test_parallel_staging_matches_the_serial_result_byte_for_byte(tmp_path, monkeypatch):
+    """
+    Correctness gate on the parallel staging path.
+
+    Running the resizes across cores is only a speed change if the pixels are
+    identical; anything else is a silent quality regression on every frame, and
+    the training run would still complete and look plausible.
+    """
+    from scan2usd.reconstruction import grut
+
+    serial = _scene(tmp_path / "serial")
+    parallel = _scene(tmp_path / "parallel")
+    for cfg in (serial, parallel):
+        cfg.reconstruction.grut_downscale = 2
+
+    manifest = SceneManifest.create(
+        scene_name="room",
+        source_config=tmp_path / "scene.yaml",
+        build_mode="preview",
+    )
+
+    original_stage_frames = grut._stage_frames
+
+    def _forced_serial(jobs, *, index_path):
+        results = [grut._stage_one(job) for job in jobs]
+        return (
+            sum(total for total, _masked in results),
+            sum(masked for _total, masked in results),
+        )
+
+    monkeypatch.setattr(grut, "_stage_frames", _forced_serial)
+    serial_dataset = prepare_grut_dataset(serial, manifest)
+    serial_files = _staged_bytes(serial_dataset.images_dir)
+
+    monkeypatch.setattr(grut, "_stage_frames", original_stage_frames)
+    parallel_dataset = prepare_grut_dataset(parallel, manifest)
+
+    assert _staged_bytes(parallel_dataset.images_dir) == serial_files
+    assert parallel_dataset.masked_pixels_fraction == serial_dataset.masked_pixels_fraction
+
+
+def test_staging_skips_unchanged_frames_and_restages_changed_ones(tmp_path, monkeypatch):
+    """
+    Staging used to redo every resize on every training run.
+
+    That is the difference between a retrain paying for staging once and paying
+    for it each time, so the skip has to be exercised — and it has to notice a
+    frame that really did change, or a re-extraction would train on stale
+    pixels while reporting success.
+    """
+    from scan2usd.reconstruction import grut
+
+    cfg = _scene(tmp_path)
+    cfg.reconstruction.grut_downscale = 2
+    manifest = SceneManifest.create(
+        scene_name="room",
+        source_config=tmp_path / "scene.yaml",
+        build_mode="preview",
+    )
+
+    staged: list[str] = []
+    real_stage_one = grut._stage_one
+
+    def _counting(job):
+        staged.append(job.image_path.name)
+        return real_stage_one(job)
+
+    monkeypatch.setattr(grut, "_stage_one", _counting)
+    # The pool would run the unpatched function in its workers, so force the
+    # in-process path; parallel-vs-serial equivalence is covered above.
+    monkeypatch.setattr(grut.os, "cpu_count", lambda: 1)
+
+    first = prepare_grut_dataset(cfg, manifest)
+    assert len(staged) == 4
+
+    staged.clear()
+    second = prepare_grut_dataset(cfg, manifest)
+    assert staged == [], "re-staged frames that had not changed"
+    assert second.masked_pixels_fraction == first.masked_pixels_fraction
+
+    staged.clear()
+    changed = cfg.nerfstudio_data_dir / "images" / "frame_001.jpg"
+    Image.new("RGB", (20, 10), color=(7, 7, 7)).save(changed)
+    prepare_grut_dataset(cfg, manifest)
+    assert staged == ["frame_001.jpg"], "missed a frame whose source changed"
+
+
+def test_restaging_at_a_new_downscale_never_writes_through_a_symlink(tmp_path):
+    """
+    Regression: switching ``grut_downscale`` 1 → 2 overwrote the source capture.
+
+    At downscale 1 staging symlinks each staged frame back to
+    ``ns_data/images``. At downscale 2 it writes a resized JPEG to the same
+    path — and ``PIL.Image.save`` follows a symlink, so the resized copy landed
+    on top of the original. On the bedroom scene that destroyed all 928
+    full-resolution frames, silently, while the run reported success.
+
+    The originals are the one artifact the pipeline cannot regenerate, so the
+    check is on the source bytes, not on the staged output.
+    """
+    from scan2usd.reconstruction.grut import _stage_image
+
+    source = tmp_path / "ns_data" / "images" / "frame_00001.jpg"
+    source.parent.mkdir(parents=True)
+    Image.new("RGB", (64, 32), color=(200, 100, 50)).save(source)
+    original = source.read_bytes()
+
+    staged = tmp_path / "staged" / "frame_00001.jpg"
+    _stage_image(source, staged, 1)
+    assert staged.is_symlink(), "downscale 1 is expected to symlink; the hazard needs one"
+
+    _stage_image(source, staged, 2)
+    assert source.read_bytes() == original, "staging overwrote the source capture"
+    assert not staged.is_symlink()
+    with Image.open(staged) as restaged:
+        assert restaged.size == (32, 16)

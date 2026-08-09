@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import sys
+from collections.abc import Sequence
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,6 +32,20 @@ class GrutDataset:
     masked_pixels_fraction: float
 
 
+def _clear_target(target: Path) -> None:
+    """
+    Remove an existing staged file before writing a new one.
+
+    Not optional. Staging at ``grut_downscale: 1`` leaves symlinks pointing back
+    into ``ns_data/images``; writing to such a path follows the link and
+    overwrites the source capture instead of the staged copy. Switching a scene
+    from 1 to 2 destroyed 928 originals exactly this way.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_symlink() or target.exists():
+        target.unlink()
+
+
 def _stage_image(source: Path, target: Path, downscale: int) -> None:
     """Copy (or link) a frame into the training set, optionally downscaled."""
     if downscale <= 1:
@@ -37,7 +54,9 @@ def _stage_image(source: Path, target: Path, downscale: int) -> None:
     with Image.open(source) as image:
         image = image.convert("RGB")
         size = (max(1, image.width // downscale), max(1, image.height // downscale))
-        image.resize(size, Image.Resampling.LANCZOS).save(target, quality=95)
+        resized = image.resize(size, Image.Resampling.LANCZOS)
+    _clear_target(target)
+    resized.save(target, quality=95)
 
 
 def _link_or_copy(source: Path, target: Path) -> None:
@@ -61,16 +80,13 @@ def _find_instance_mask(mask_dir: Path, image_path: Path) -> Path | None:
 
 def _environment_keep_mask(
     image_path: Path,
-    object_mask_dirs: list[Path],
+    object_masks: Sequence[Path],
 ) -> tuple[np.ndarray, int]:
     with Image.open(image_path) as image:
         width, height = image.size
     keep = np.ones((height, width), dtype=np.uint8) * 255
     masked = 0
-    for mask_dir in object_mask_dirs:
-        path = _find_instance_mask(mask_dir, image_path)
-        if path is None:
-            continue
+    for path in object_masks:
         with Image.open(path) as raw_mask:
             mask = np.asarray(
                 raw_mask.convert("L").resize((width, height), Image.Resampling.NEAREST)
@@ -80,6 +96,139 @@ def _environment_keep_mask(
         masked += int(newly_masked.sum())
         keep[foreground] = 0
     return keep, masked
+
+
+@dataclass(frozen=True)
+class _StageJob:
+    """Everything one frame's staging needs, resolved up front so it can be pickled."""
+
+    image_path: Path
+    staged_image: Path
+    staged_mask: Path
+    object_masks: tuple[Path, ...]
+    clean_plate: Path | None
+    downscale: int
+
+
+def _stage_one(job: _StageJob) -> tuple[int, int]:
+    """Stage one frame + its keep mask. Returns (total pixels, masked pixels)."""
+    keep, masked = _environment_keep_mask(job.image_path, job.object_masks)
+    if job.clean_plate is not None and masked:
+        with Image.open(job.image_path) as source_raw, Image.open(job.clean_plate) as clean_raw:
+            source = np.asarray(source_raw.convert("RGB"))
+            clean = np.asarray(
+                clean_raw.convert("RGB").resize(
+                    (source.shape[1], source.shape[0]),
+                    Image.Resampling.LANCZOS,
+                )
+            )
+        composited = source.copy()
+        foreground = keep == 0
+        composited[foreground] = clean[foreground]
+        composited_image = Image.fromarray(composited)
+        if job.downscale > 1:
+            composited_image = composited_image.resize(
+                (composited.shape[1] // job.downscale, composited.shape[0] // job.downscale),
+                Image.Resampling.LANCZOS,
+            )
+        _clear_target(job.staged_image)
+        composited_image.save(job.staged_image)
+        keep[:] = 255
+    else:
+        _stage_image(job.image_path, job.staged_image, job.downscale)
+    mask_image = Image.fromarray(keep, mode="L")
+    if job.downscale > 1:
+        mask_image = mask_image.resize(
+            (max(1, keep.shape[1] // job.downscale), max(1, keep.shape[0] // job.downscale)),
+            Image.Resampling.NEAREST,
+        )
+    _clear_target(job.staged_mask)
+    mask_image.save(job.staged_mask)
+    return int(keep.size), masked
+
+
+def _stage_key(job: _StageJob) -> str:
+    """
+    Identify the inputs that decide a staged frame's contents.
+
+    Size and mtime rather than a content hash: reading 928 4K JPEGs to decide
+    whether to re-encode them costs about as much as re-encoding them, which
+    would defeat the point. The failure mode this misses — a file rewritten
+    within the same mtime granularity at exactly the same size — does not
+    happen to frames written once by extraction.
+    """
+    parts = [str(job.downscale)]
+    for path in (job.image_path, job.clean_plate, *job.object_masks):
+        if path is None:
+            parts.append("-")
+            continue
+        try:
+            info = path.stat()
+        except OSError:
+            parts.append(f"{path}:missing")
+        else:
+            parts.append(f"{path}:{info.st_size}:{info.st_mtime_ns}")
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
+
+
+def _stage_frames(jobs: Sequence[_StageJob], *, index_path: Path) -> tuple[int, int]:
+    """
+    Stage every frame, skipping those already staged from identical inputs.
+
+    Two changes over the loop this replaces, both of which matter once
+    ``grut_downscale`` is above 1 and each frame is a real 4K decode + LANCZOS
+    resize rather than a symlink:
+
+    * the work runs across cores — the frames are independent, and this was the
+      one stage still spending minutes on a single core;
+    * a re-run with unchanged frames does nothing, because staging previously
+      had no skip at all and repeated the full resize on every training run.
+
+    The pixel counts are cached alongside the keys, so a skipped frame still
+    contributes to ``masked_pixels_fraction`` without being re-read.
+    """
+    previous: dict[str, list[int | str]] = {}
+    if index_path.is_file():
+        try:
+            stored = json.loads(index_path.read_text(encoding="utf-8"))
+            if stored.get("schema_version") == "1.0":
+                previous = stored.get("frames", {})
+        except (OSError, ValueError):
+            previous = {}
+
+    index: dict[str, list[int | str]] = {}
+    pending: list[_StageJob] = []
+    pending_keys: list[str] = []
+    for job in jobs:
+        key = _stage_key(job)
+        cached = previous.get(job.image_path.name)
+        staged_present = (
+            job.staged_image.exists() or job.staged_image.is_symlink()
+        ) and job.staged_mask.is_file()
+        if cached and cached[0] == key and staged_present:
+            index[job.image_path.name] = cached
+        else:
+            pending.append(job)
+            pending_keys.append(key)
+
+    if pending:
+        workers = max(1, min(len(pending), (os.cpu_count() or 2) - 2))
+        if workers > 1 and len(pending) > 1:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                results = list(pool.map(_stage_one, pending, chunksize=4))
+        else:
+            results = [_stage_one(job) for job in pending]
+        for job, key, (total, masked) in zip(pending, pending_keys, results, strict=True):
+            index[job.image_path.name] = [key, total, masked]
+
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(
+        json.dumps({"schema_version": "1.0", "frames": index}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    total_pixels = sum(int(entry[1]) for entry in index.values())
+    masked_pixels = sum(int(entry[2]) for entry in index.values())
+    return total_pixels, masked_pixels
 
 
 def _matching_clean_plate(clean_plate_dir: Path | None, image_path: Path) -> Path | None:
@@ -233,47 +382,31 @@ def prepare_grut_dataset(
     if not images:
         raise RuntimeError(f"No images found under {source_images}")
 
-    total_pixels = 0
-    masked_pixels = 0
     held_out: list[str] = []
     interval = _test_interval(cfg.reconstruction.held_out_ratio)
+    jobs = []
     for index, image_path in enumerate(images):
-        staged_image = images_out / image_path.name
-        keep, masked = _environment_keep_mask(image_path, object_mask_dirs)
-        clean_plate = _matching_clean_plate(cfg.capture.clean_plate_dir, image_path)
-        if clean_plate is not None and masked:
-            with Image.open(image_path) as source_raw, Image.open(clean_plate) as clean_raw:
-                source = np.asarray(source_raw.convert("RGB"))
-                clean = np.asarray(
-                    clean_raw.convert("RGB").resize(
-                        (source.shape[1], source.shape[0]),
-                        Image.Resampling.LANCZOS,
+        jobs.append(
+            _StageJob(
+                image_path=image_path,
+                staged_image=images_out / image_path.name,
+                staged_mask=images_out / f"{image_path.stem}_mask.png",
+                object_masks=tuple(
+                    resolved
+                    for resolved in (
+                        _find_instance_mask(mask_dir, image_path)
+                        for mask_dir in object_mask_dirs
                     )
-                )
-            composited = source.copy()
-            foreground = keep == 0
-            composited[foreground] = clean[foreground]
-            composited_image = Image.fromarray(composited)
-            if downscale > 1:
-                composited_image = composited_image.resize(
-                    (composited.shape[1] // downscale, composited.shape[0] // downscale),
-                    Image.Resampling.LANCZOS,
-                )
-            composited_image.save(staged_image)
-            keep[:] = 255
-        else:
-            _stage_image(image_path, staged_image, downscale)
-        mask_image = Image.fromarray(keep, mode="L")
-        if downscale > 1:
-            mask_image = mask_image.resize(
-                (max(1, keep.shape[1] // downscale), max(1, keep.shape[0] // downscale)),
-                Image.Resampling.NEAREST,
+                    if resolved is not None
+                ),
+                clean_plate=_matching_clean_plate(cfg.capture.clean_plate_dir, image_path),
+                downscale=downscale,
             )
-        mask_image.save(images_out / f"{image_path.stem}_mask.png")
-        total_pixels += int(keep.size)
-        masked_pixels += masked
+        )
         if interval and index % interval == 0:
             held_out.append(image_path.name)
+
+    total_pixels, masked_pixels = _stage_frames(jobs, index_path=root / "staging_index.json")
 
     sparse_out = root / "sparse"
     if sparse_out.exists():

@@ -100,13 +100,19 @@ def extract_frames(
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     pbar = tqdm(total=total or None, desc="extract_frames")
     while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
+        # Frames the stride rejects are grabbed, not retrieved. grab() advances
+        # the decoder exactly as read() would — so the kept frames are identical
+        # — but skips the BGR conversion of the 14-in-15 frames that were only
+        # ever going to be thrown away.
         if idx % stride != 0:
+            if not cap.grab():
+                break
             idx += 1
             pbar.update(1)
             continue
+        ok, frame = cap.read()
+        if not ok:
+            break
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if blur_threshold > 0 and variance_of_laplacian(gray) < blur_threshold:
             rejected_blur += 1
