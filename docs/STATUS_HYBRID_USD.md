@@ -284,6 +284,45 @@ PLY grows 35 MB → 61.5 MB.
    0.07 PSNR of the independently recorded baseline.
 2. Staging wrote through symlinks — see below.
 
+**selective_adam: measured, not adopted.** 3DGRUT ships Taming-3DGS'
+``SelectiveAdam``, which updates only the Gaussians visible in the current view
+via a fused CUDA kernel. Reachable through ``grut_overrides`` as
+``optimizer.type=selective_adam``. One 50k run at 1080p against the Adam
+baseline, same COLMAP solve, same 74 held-out views:
+
+===============  ==========  ========  ========  =========  ==========
+optimizer        train time  PSNR      SSIM      LPIPS      Gaussians
+===============  ==========  ========  ========  =========  ==========
+adam             53 m 00 s   19.372    0.7426    0.4159     904,885
+selective_adam   48 m 12 s   19.254    0.7409    0.4226     876,161
+===============  ==========  ========  ========  =========  ==========
+
+4m48s (9%) faster, slightly behind on all three metrics. Default stays ``adam``.
+One run each, and densification is stochastic — the two runs ended with
+different Gaussian counts — so the 0.12 PSNR gap is within plausible run-to-run
+variance. The defensible claim is not "worse" but "no gain worth 5 minutes":
+the masking only pays once most Gaussians are off-screen per view, and a small
+room seen wide-angle culls little. Early training was *slower* (37 vs 50 it/s)
+until the model grew.
+
+Getting it to run at all needed two one-line fixes in the vendored 3DGRUT
+checkout, both upstream bugs — ``setup_optimizers.py`` calls
+``torch.utils.cpp_extension`` without importing that submodule, and
+``optimizers/__init__.py`` discards the module the build returns and then does
+a bare ``import lib_optimizers_cc``, which cannot resolve because torch writes
+the extension to ``~/.cache/torch_extensions``. The CUDA source itself compiles
+cleanly. Those patches live outside this repo and any 3DGRUT update drops them.
+
+**Silent stale-model export (fixed).** With the plugin missing, training raised
+on startup — and the pipeline exited 0 with a valid preview. The recovery path
+for "training finished but the in-process USD export ran out of VRAM" caught the
+crash, searched ``build/visual`` by mtime, and re-exported *the previous run's*
+checkpoint. Scoring that would have read "selective_adam matches Adam exactly
+and trains in 2 minutes". Nothing downstream can catch this: the USD is valid
+and the cleanup report is self-consistent. ``find_latest_grut_checkpoint`` now
+takes ``newer_than``, anchored to when training started, so a run that dies
+before writing a checkpoint re-raises instead of resurrecting an older model.
+
 **Data loss (fixed).** Staging at ``grut_downscale: 1`` symlinks each staged
 frame back to ``ns_data/images``. Raising it to 2 makes staging write a resized
 JPEG to that same path, and ``PIL.Image.save`` follows symlinks — so all 928

@@ -487,3 +487,43 @@ def test_restaging_at_a_new_downscale_never_writes_through_a_symlink(tmp_path):
     assert not staged.is_symlink()
     with Image.open(staged) as restaged:
         assert restaged.size == (32, 16)
+
+
+def test_failed_training_never_recovers_a_previous_run(tmp_path, monkeypatch):
+    """
+    Regression: a crashed run re-exported the *previous* run's checkpoint.
+
+    The recovery path exists for a real failure — 3DGRUT exports from inside
+    the training process and can run out of VRAM after training succeeded — but
+    it caught every exception and searched all of ``build/visual`` by mtime. So
+    ``optimizer.type=selective_adam``, whose CUDA plugin was not compiled,
+    raised on startup and the pipeline exported last night's plain-Adam model,
+    reported success, and produced a preview that looked entirely correct.
+
+    Nothing downstream can detect that: the USD is valid, the cleanup report is
+    consistent, the metrics are good. The only defence is refusing to recover
+    from a checkpoint this run did not write.
+    """
+    import time
+
+    from scan2usd.reconstruction.grut import find_latest_grut_checkpoint
+
+    build_root = tmp_path / "visual"
+    stale = build_root / "bedroom_static" / "run-0808_234359"
+    stale.mkdir(parents=True)
+    (stale / "ckpt_last.pt").write_bytes(b"previous run")
+
+    started_at = time.time() + 1.0  # this run begins after the stale checkpoint
+    assert find_latest_grut_checkpoint(build_root) is not None, "unbounded search finds it"
+    assert find_latest_grut_checkpoint(build_root, newer_than=started_at) is None, (
+        "recovery accepted a checkpoint from an earlier run"
+    )
+
+    fresh = build_root / "bedroom_static" / "run-0809_011600"
+    fresh.mkdir(parents=True)
+    checkpoint = fresh / "ckpt_last.pt"
+    checkpoint.write_bytes(b"this run")
+    import os
+
+    os.utime(checkpoint, (started_at + 1, started_at + 1))
+    assert find_latest_grut_checkpoint(build_root, newer_than=started_at) == checkpoint

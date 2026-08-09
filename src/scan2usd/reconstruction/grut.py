@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -606,10 +607,23 @@ def grut_train_args(
     return args
 
 
-def find_latest_grut_checkpoint(build_root: Path) -> Path | None:
-    """Newest ``ckpt_last.pt`` under a 3DGRUT output directory."""
+def find_latest_grut_checkpoint(build_root: Path, *, newer_than: float = 0.0) -> Path | None:
+    """
+    Newest ``ckpt_last.pt`` under a 3DGRUT output directory.
+
+    ``newer_than`` restricts the search to checkpoints written after a given
+    time — pass the moment training started to exclude every earlier run. 3DGRUT
+    writes each run into its own ``<experiment>-<timestamp>/`` directory, so
+    without that bound this happily returns yesterday's model.
+    """
     checkpoints = sorted(
-        build_root.rglob("ckpt_last.pt"), key=lambda p: p.stat().st_mtime, reverse=True
+        (
+            path
+            for path in build_root.rglob("ckpt_last.pt")
+            if path.stat().st_mtime >= newer_than
+        ),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
     )
     return checkpoints[0] if checkpoints else None
 
@@ -618,15 +632,25 @@ def _recover_export_from_checkpoint(
     cfg: SceneConfig,
     build_root: Path,
     output_usd: Path,
+    *,
+    newer_than: float,
 ) -> bool:
     """
-    Re-run the USD export alone, from the saved checkpoint.
+    Re-run the USD export alone, from the checkpoint this run just wrote.
 
     A fresh process carries none of training's optimizer state, so the export
     fits in memory that the training process could not spare. Returns False when
-    there is no checkpoint to recover from.
+    this run produced no checkpoint to recover from.
+
+    ``newer_than`` is what separates "training finished, the export ran out of
+    VRAM" — the case this exists for — from "training died". Without it, a run
+    that crashed before step 1 recovers the *previous* run's checkpoint and
+    reports success, so a broken config silently re-exports the model it was
+    meant to replace. That happened with ``optimizer.type=selective_adam``: the
+    CUDA plugin was not built, training raised on startup, and the pipeline
+    exported the plain-Adam model as if it were the result.
     """
-    checkpoint = find_latest_grut_checkpoint(build_root)
+    checkpoint = find_latest_grut_checkpoint(build_root, newer_than=newer_than)
     if checkpoint is None:
         return False
     adapter, _train = resolve_grut(cfg)
@@ -665,6 +689,10 @@ def export_environment_particlefield(
     output_usd = build_root / f"environment_splat.{suffix}"
     output_usd.parent.mkdir(parents=True, exist_ok=True)
     adapter, _train = resolve_grut(cfg)
+    # Anchor the recovery below to this run. Filesystem mtimes have coarser
+    # granularity than perf counters, so step back a second rather than risk
+    # excluding a checkpoint written in the same tick training started.
+    started_at = time.time() - 1.0
     try:
         adapter.run(*grut_train_args(cfg, dataset, output_dir=build_root, output_usd=output_usd))
     except Exception as exc:  # noqa: BLE001
@@ -673,7 +701,9 @@ def export_environment_particlefield(
         # training finished. Observed repeatedly on 8 GB: ~7.4 GiB in use, export
         # asks for another 0.5 GiB and dies. The checkpoint is already on disk at
         # that point, so re-export in a clean process rather than losing the run.
-        if not _recover_export_from_checkpoint(cfg, build_root, output_usd):
+        if not _recover_export_from_checkpoint(
+            cfg, build_root, output_usd, newer_than=started_at
+        ):
             raise
         manifest.warnings.append(
             f"3DGRUT in-process export failed ({type(exc).__name__}); "
